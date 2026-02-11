@@ -71,6 +71,7 @@ class SGLangModel(Model):
         sampling_params: dict[str, Any] | None  # Passed to /generate endpoint
         return_logprob: bool | None  # Return logprobs for all tokens (default: True)
         enable_thinking: bool | None  # Enable thinking mode for Qwen3 hybrid models
+        return_routed_experts: bool | None  # Record MoE routing decisions for routing replay
 
     def __init__(
         self,
@@ -408,7 +409,111 @@ class SGLangModel(Model):
             }
             yield {"contentBlockStop": {}}
 
+<<<<<<< HEAD
         # Assistant message stop
+=======
+    def _extract_logprobs(self, event: dict[str, Any], key: str) -> list[float] | None:
+        """Extract logprobs from SGLang event (format: [[logprob, token_id, ...], ...])."""
+        meta_info = event.get("meta_info", {})
+        logprobs = meta_info.get(key) or event.get(key)
+        if isinstance(logprobs, list) and logprobs:
+            return [entry[0] for entry in logprobs]
+        return None
+
+    @override
+    async def stream(
+        self,
+        messages: Messages,
+        tool_specs: list[ToolSpec] | None = None,
+        system_prompt: str | None = None,
+        *,
+        tool_choice: ToolChoice | None = None,
+        system_prompt_content: list[SystemContentBlock] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterable[StreamEvent]:
+        """Chat completion with SGLangModel using the `/generate` endpoint.
+
+        The `stream` method follows Strands' protocol but actually disabled here for training-only usage.
+        This means users won't see streaming behavior such as print callbacks.
+        """
+        # Format tools (only on first call)
+        if tool_specs and not self._current_tools:
+            self._current_tools = self._format_tools(tool_specs)
+            logger.debug(f"tools formatted: {len(self._current_tools)} tools")
+
+        # Prepare request
+        config = self.get_config()
+        sampling_params: dict[str, Any] = dict(config.get("sampling_params") or {})
+        return_logprob = config.get("return_logprob", True)
+        return_routed_experts = config.get("return_routed_experts", False)
+        new_input_tokens = self.tokenize_prompt_messages(messages, system_prompt)
+        # Tracking token IDs in token_manager to ensure the token-in feature
+        input_ids = self.token_manager.token_ids + (new_input_tokens or [])
+
+        # Start message
+        yield {"messageStart": {"role": "assistant"}}
+        yield {"contentBlockStart": {"start": {}}}
+
+        # Call SGLangClient (non-streaming POST for better parallelism)
+        try:
+            response = await self.client.generate(
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob,
+                logprob_start_len=0 if return_logprob else None,
+                return_routed_experts=return_routed_experts,
+                routed_experts_start_len=len(self.token_manager) if return_routed_experts else None,
+            )
+
+            # Extract response data
+            text = response.get("text", "")
+            output_ids = response.get("output_ids", [])
+            output_logprobs = self._extract_logprobs(response, "output_token_logprobs")
+            input_logprobs = self._extract_logprobs(response, "input_token_logprobs")
+            meta_info = response.get("meta_info", {})
+
+            # Yield text as single delta (non-streaming gives complete text at once)
+            if text:
+                yield {"contentBlockDelta": {"delta": {"text": text}}}
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            error_text = e.response.text.lower()
+            # Context/prompt length exceeded (various SGLang error patterns)
+            if status == 400:
+                length_patterns = ["exceed", "too long", "max model len", "maximum length", "context length"]
+                if any(p in error_text for p in length_patterns):
+                    raise ContextWindowOverflowException(f"Context length exceeded: {e.response.text}") from e
+                # Log unexpected 400 errors for debugging
+                logger.warning(f"Unexpected 400 error: {e.response.text}")
+            # Rate limiting / service unavailable
+            if status in (429, 503):
+                raise ModelThrottledException(f"Service throttled (status={status}): {e.response.text}") from e
+            raise  # Re-raise other HTTP errors
+
+        # Update token trajectory
+        if new_input_tokens:
+            new_input_logprobs = input_logprobs[-len(new_input_tokens) :] if input_logprobs else None
+            self.token_manager.add_prompt(token_ids=new_input_tokens, logprobs=new_input_logprobs)
+        if output_ids:
+            self.token_manager.add_response(token_ids=output_ids, logprobs=output_logprobs)
+        self._processed_message_count = len(messages) + 1
+
+        # Accumulate routed experts for routing replay
+        routed_experts_data = meta_info.get("routed_experts") if return_routed_experts else None
+        if routed_experts_data:
+            self.token_manager.add_routed_experts(routed_experts_data)
+
+        # End text block, start tool use blocks if there are any tool calls
+        yield {"contentBlockStop": {}}
+
+        # Parse tool calls and yield events
+        parsed_tool_calls = self.tool_parser.parse(text)
+        for event in self._yield_tool_use_events(parsed_tool_calls):
+            yield event
+
+        # Determine stop reason
+>>>>>>> 851f4fb (feat(token): add routing replay support for MoE models)
         stop_reason: str = "tool_use" if parsed_tool_calls else "end_turn"
         if meta_info["finish_reason"]["type"] == "length":
             stop_reason = "max_tokens"
