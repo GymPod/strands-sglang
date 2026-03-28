@@ -31,7 +31,6 @@ For RL training, you typically want:
 
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 
 
@@ -71,12 +70,12 @@ class TokenManager:
     def __init__(self) -> None:
         """Create a TokenManager."""
         self._segments: list[list[Token]] = []
-        self._routed_expert_chunks: list[bytes] = []
+        self._routed_experts_data: str | None = None
 
     def reset(self) -> None:
         """Reset token accumulation for a new episode."""
         self._segments = []
-        self._routed_expert_chunks = []
+        self._routed_experts_data = None
 
     def add_prompt(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
         """Add a prompt segment (system messages, user input, tool results)."""
@@ -115,34 +114,33 @@ class TokenManager:
         self._segments.append(tokens)
 
     def add_routed_experts(self, data: str) -> None:
-        """Add a base64-encoded routed experts chunk from an SGLang response.
+        """Store routed experts from an SGLang response.
 
         SGLang returns routed experts as a base64-encoded string of flattened
-        int32 values with shape ``[num_tokens, num_layers, top_k]``. Each call
-        to this method appends the decoded bytes so that the full trajectory
-        can be reconstructed via the :pyattr:`routed_experts` property.
+        int32 values with shape ``[num_tokens, num_layers, top_k]``.  Each
+        response covers ALL tokens in the sequence (not just new tokens),
+        because SGLang does not support ``routed_experts_start_len``.
+        Therefore we overwrite rather than accumulate — the latest call
+        always has the complete routing for the full trajectory.
 
         Args:
             data: Base64-encoded routed experts string from ``meta_info["routed_experts"]``.
         """
-        self._routed_expert_chunks.append(base64.b64decode(data))
+        self._routed_experts_data = data
 
     @property
     def routed_experts(self) -> str | None:
-        """Get accumulated routed experts as a base64-encoded string.
+        """Get routed experts as a base64-encoded string.
 
-        Returns the concatenation of all chunks collected via
-        :pymeth:`add_routed_experts`, re-encoded as a single base64 string
-        matching the format returned by SGLang's ``/generate`` endpoint.
+        Returns the routing data from the most recent SGLang response,
+        which covers all ``seqlen - 1`` tokens in the trajectory.
 
         Returns:
             Base64-encoded string of int32 expert IDs with logical shape
-            ``[total_tokens, num_layers, top_k]``, or ``None`` if no routing
-            data has been recorded.
+            ``[total_tokens - 1, num_layers, top_k]``, or ``None`` if no
+            routing data has been recorded.
         """
-        if not self._routed_expert_chunks:
-            return None
-        return base64.b64encode(b"".join(self._routed_expert_chunks)).decode("ascii")
+        return self._routed_experts_data
 
     @property
     def tokens(self) -> list[Token]:
