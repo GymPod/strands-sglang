@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-<<<<<<< HEAD
-"""Token management for token-in/token-out training."""
-=======
 """Token management for TITO (Token-In/Token-Out) training.
 
 This module provides:
@@ -27,7 +24,6 @@ For RL training, you typically want:
 - logprobs: Log probabilities for policy gradient
 - routed_experts: Base64-encoded MoE routing decisions for routing replay
 """
->>>>>>> 851f4fb (feat(token): add routing replay support for MoE models)
 
 from __future__ import annotations
 

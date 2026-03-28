@@ -269,13 +269,11 @@ class TestEdgeCases:
         assert manager.token_ids == [1, 2, 3]
         assert manager.loss_mask == [False, True, False]
 
-    def test_logprobs_longer_than_tokens(self):
-        """Extra logprobs are ignored (only uses indices up to token count)."""
+    def test_logprobs_longer_than_tokens_raises(self):
+        """Extra logprobs raise ValueError (strict length check)."""
         manager = TokenManager()
-        manager.add_prompt([1, 2], logprobs=[-0.1, -0.2, -0.3, -0.4])
-
-        # Only first 2 logprobs used
-        assert manager.logprobs == [-0.1, -0.2]
+        with pytest.raises(ValueError, match="logprobs length"):
+            manager.add_prompt([1, 2], logprobs=[-0.1, -0.2, -0.3, -0.4])
 
     def test_zero_logprob(self):
         """Zero logprob is valid and preserved."""
@@ -324,23 +322,23 @@ class TestRoutedExperts:
         decoded = struct.unpack(f"<{len(experts)}i", base64.b64decode(result))
         assert list(decoded) == experts
 
-    def test_multi_turn_accumulation(self):
-        """Multiple chunks are concatenated in order."""
+    def test_multi_turn_overwrites(self):
+        """Second call overwrites first (SGLang returns routing for ALL tokens each turn)."""
         manager = TokenManager()
 
         # Turn 1: prompt + response routing (3 tokens, 1 layer, top_k=2)
         turn1_experts = [10, 20, 30, 40, 50, 60]  # 3 tokens * 1 layer * 2 experts
         manager.add_routed_experts(_make_routed_experts_b64(turn1_experts))
 
-        # Turn 2: new tokens routing (2 tokens, 1 layer, top_k=2)
-        turn2_experts = [70, 80, 90, 100]  # 2 tokens * 1 layer * 2 experts
+        # Turn 2: SGLang returns routing for ALL tokens (5 tokens now)
+        turn2_experts = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]  # 5 tokens * 1 layer * 2 experts
         manager.add_routed_experts(_make_routed_experts_b64(turn2_experts))
 
+        # Result should be turn 2's data only (overwrite, not concatenate)
         result = manager.routed_experts
         assert result is not None
-        all_experts = turn1_experts + turn2_experts
-        decoded = struct.unpack(f"<{len(all_experts)}i", base64.b64decode(result))
-        assert list(decoded) == all_experts
+        decoded = struct.unpack(f"<{len(turn2_experts)}i", base64.b64decode(result))
+        assert list(decoded) == turn2_experts
 
     def test_reset_then_reuse(self):
         """Routing data can be accumulated after reset."""
