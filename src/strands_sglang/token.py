@@ -12,10 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Token management for token-in/token-out training."""
+"""Token management for TITO (Token-In/Token-Out) training.
+
+This module provides:
+- Token: A single token with ID, logprob, and loss mask
+- TokenManager: Manages segment-based token accumulation
+
+For RL training, you typically want:
+- token_ids: Flat list of all tokens for the trajectory
+- loss_mask: Integer mask for loss computation (1 = model output, 0 = prompt/tool)
+- logprobs: Log probabilities for policy gradient
+- routed_experts: Raw bytes of MoE routing decisions for routing replay
+"""
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 
 
@@ -55,10 +67,12 @@ class TokenManager:
     def __init__(self) -> None:
         """Create a TokenManager."""
         self._segments: list[list[Token]] = []
+        self._routed_experts_bytes: bytes | None = None
 
     def reset(self) -> None:
         """Reset token accumulation for a new episode."""
         self._segments = []
+        self._routed_experts_bytes = None
 
     def add_prompt(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
         """Add a prompt segment (system messages, user input, tool results)."""
@@ -95,6 +109,55 @@ class TokenManager:
             for i, tid in enumerate(token_ids)
         ]
         self._segments.append(tokens)
+
+    def add_routed_experts(self, data: str) -> None:
+        """Store routed experts from an SGLang response.
+
+        Decodes the base64 wire format and stores raw bytes. SGLang returns
+        routed experts as a base64-encoded string of flattened int32 values
+        with shape ``[num_tokens, num_layers, top_k]``.  Each response covers
+        ALL tokens in the sequence (not just new tokens), because SGLang does
+        not support ``routed_experts_start_len``. Therefore we overwrite rather
+        than accumulate — the latest call always has the complete routing.
+
+        **Design tradeoffs (overwrite vs accumulate)**:
+
+        Current approach is *overwrite*: each call replaces all stored routing.
+        For single-turn rollouts, this is trivially correct. For multi-turn,
+        SGLang re-computes routing for the full sequence each turn. Within a
+        single episode (no weight update between turns), the MoE router is
+        deterministic — same weights + same tokens = same routing — so
+        overwriting produces identical results to accumulating.
+
+        If model weights update between turns (async RL), the re-computed
+        prefix routing reflects the new weights rather than the weights that
+        originally generated those tokens. An *accumulate* approach (keep
+        prior turns' routing, append only new tokens' portion) would preserve
+        per-token routing-logprob correspondence. This can be done client-side
+        by slicing at ``len(existing_bytes)`` without SGLang changes.
+        Overwrite is simpler and sufficient for the common case; accumulate
+        is a future optimization for long multi-turn async rollouts.
+
+        Args:
+            data: Base64-encoded routed experts string from
+                ``meta_info["routed_experts"]``.
+        """
+        self._routed_experts_bytes = base64.b64decode(data)
+
+    @property
+    def routed_experts(self) -> bytes | None:
+        """Get routed experts as raw bytes.
+
+        Returns the decoded routing data from the most recent SGLang response,
+        which covers all ``seqlen - 1`` tokens in the trajectory. The bytes
+        contain flattened int32 expert IDs with logical shape
+        ``[total_tokens - 1, num_layers, top_k]``.
+
+        Returns:
+            Raw bytes of int32 expert IDs, or ``None`` if no routing data
+            has been recorded.
+        """
+        return self._routed_experts_bytes
 
     @property
     def tokens(self) -> list[Token]:

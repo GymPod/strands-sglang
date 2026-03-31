@@ -14,6 +14,9 @@
 
 """Unit tests for token module."""
 
+import base64
+import struct
+
 import pytest
 
 from strands_sglang import Token, TokenManager
@@ -205,6 +208,16 @@ class TestTokenManagerReset:
         assert manager.tokens == []
         assert manager.segments == []
 
+    def test_reset_clears_routed_experts(self):
+        """reset clears accumulated routed experts."""
+        manager = TokenManager()
+        chunk = base64.b64encode(b"\x01\x00\x00\x00").decode("ascii")
+        manager.add_routed_experts(chunk)
+
+        manager.reset()
+
+        assert manager.routed_experts is None
+
     def test_reset_allows_reuse(self):
         """Manager can be reused after reset."""
         manager = TokenManager()
@@ -218,3 +231,126 @@ class TestTokenManagerReset:
 
         assert manager.token_ids == [10, 20, 30]
         assert len(manager) == 3
+
+
+class TestTokenManagerTokensProperty:
+    """Tests for tokens property and iteration."""
+
+    def test_tokens_returns_flat_list(self):
+        """tokens property returns all tokens in order."""
+        manager = TokenManager()
+        manager.add_prompt([1, 2])
+        manager.add_response([3, 4])
+
+        tokens = manager.tokens
+        assert len(tokens) == 4
+        assert [t.token_id for t in tokens] == [1, 2, 3, 4]
+
+    def test_len_counts_all_tokens(self):
+        """__len__ returns total token count across segments."""
+        manager = TokenManager()
+        manager.add_prompt([1, 2, 3])
+        manager.add_response([4])
+        manager.add_prompt([5, 6])
+
+        assert len(manager) == 6
+
+
+class TestEdgeCases:
+    """Edge case tests."""
+
+    def test_single_token_segments(self):
+        """Single-token segments work correctly."""
+        manager = TokenManager()
+        manager.add_prompt([1])
+        manager.add_response([2])
+        manager.add_prompt([3])
+
+        assert manager.token_ids == [1, 2, 3]
+        assert manager.loss_mask == [False, True, False]
+
+    def test_logprobs_longer_than_tokens_raises(self):
+        """Extra logprobs raise ValueError (strict length check)."""
+        manager = TokenManager()
+        with pytest.raises(ValueError, match="logprobs length"):
+            manager.add_prompt([1, 2], logprobs=[-0.1, -0.2, -0.3, -0.4])
+
+    def test_zero_logprob(self):
+        """Zero logprob is valid and preserved."""
+        manager = TokenManager()
+        manager.add_prompt([0])
+        manager.add_response([1], logprobs=[0.0])
+        assert manager.logprobs[1:] == [0.0]
+
+    def test_negative_token_ids(self):
+        """Negative token IDs are accepted (some tokenizers use them)."""
+        manager = TokenManager()
+        manager.add_prompt([-1, -100])
+        assert manager.token_ids == [-1, -100]
+
+    def test_large_token_ids(self):
+        """Large token IDs are handled."""
+        manager = TokenManager()
+        manager.add_prompt([100000, 999999])
+        assert manager.token_ids == [100000, 999999]
+
+
+def _make_routed_experts_b64(expert_ids: list[int]) -> str:
+    """Helper: encode a list of int32 expert IDs to base64 (matching SGLang format)."""
+    raw = struct.pack(f"<{len(expert_ids)}i", *expert_ids)
+    return base64.b64encode(raw).decode("ascii")
+
+
+class TestRoutedExperts:
+    """Tests for routed experts accumulation."""
+
+    def test_empty_manager_returns_none(self):
+        """No routing data returns None."""
+        manager = TokenManager()
+        assert manager.routed_experts is None
+
+    def test_single_chunk(self):
+        """Single chunk: base64 decoded to raw bytes."""
+        manager = TokenManager()
+        experts = [0, 1, 2, 3]
+        chunk = _make_routed_experts_b64(experts)
+
+        manager.add_routed_experts(chunk)
+
+        result = manager.routed_experts
+        assert result is not None
+        assert isinstance(result, bytes)
+        decoded = struct.unpack(f"<{len(experts)}i", result)
+        assert list(decoded) == experts
+
+    def test_multi_turn_overwrites(self):
+        """Second call overwrites first (SGLang returns routing for ALL tokens each turn)."""
+        manager = TokenManager()
+
+        # Turn 1: prompt + response routing (3 tokens, 1 layer, top_k=2)
+        turn1_experts = [10, 20, 30, 40, 50, 60]  # 3 tokens * 1 layer * 2 experts
+        manager.add_routed_experts(_make_routed_experts_b64(turn1_experts))
+
+        # Turn 2: SGLang returns routing for ALL tokens (5 tokens now)
+        turn2_experts = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]  # 5 tokens * 1 layer * 2 experts
+        manager.add_routed_experts(_make_routed_experts_b64(turn2_experts))
+
+        # Result should be turn 2's data only (overwrite, not concatenate)
+        result = manager.routed_experts
+        assert result is not None
+        decoded = struct.unpack(f"<{len(turn2_experts)}i", result)
+        assert list(decoded) == turn2_experts
+
+    def test_reset_then_reuse(self):
+        """Routing data can be accumulated after reset."""
+        manager = TokenManager()
+        manager.add_routed_experts(_make_routed_experts_b64([1, 2]))
+        manager.reset()
+
+        new_experts = [5, 6, 7]
+        manager.add_routed_experts(_make_routed_experts_b64(new_experts))
+
+        result = manager.routed_experts
+        assert result is not None
+        decoded = struct.unpack(f"<{len(new_experts)}i", result)
+        assert list(decoded) == new_experts

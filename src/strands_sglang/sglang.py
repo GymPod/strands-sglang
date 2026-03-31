@@ -71,6 +71,7 @@ class SGLangModel(Model):
         sampling_params: dict[str, Any] | None  # Passed to /generate endpoint
         return_logprob: bool | None  # Return logprobs for all tokens (default: True)
         enable_thinking: bool | None  # Enable thinking mode for Qwen3 hybrid models
+        return_routed_experts: bool | None  # Record MoE routing decisions for routing replay
 
     def __init__(
         self,
@@ -342,6 +343,7 @@ class SGLangModel(Model):
         yield {"contentBlockStart": {"start": {}}}
 
         # Call SGLang's `/generate` endpoint
+        return_routed_experts = config.get("return_routed_experts", False)
         try:
             response = await self.client.generate(
                 input_ids=input_ids,
@@ -349,6 +351,7 @@ class SGLangModel(Model):
                 return_logprob=return_logprob,
                 logprob_start_len=max(0, len(self.token_manager.token_ids) - 1) if return_logprob else None,
                 image_data=self.image_data or None,
+                return_routed_experts=return_routed_experts,
             )
 
             # Extract response data
@@ -376,6 +379,13 @@ class SGLangModel(Model):
             logprobs=[e[0] for e in output_token_logprobs] if output_token_logprobs else None,
         )
         self.message_count = len(messages) + 1
+
+        # Store routed experts for routing replay (overwrite semantics —
+        # SGLang returns routing for ALL tokens each turn, not incremental)
+        if return_routed_experts:
+            routed_experts_data = meta_info.get("routed_experts")
+            if routed_experts_data:
+                self.token_manager.add_routed_experts(routed_experts_data)
 
         # Assistant message content stop
         yield {"contentBlockStop": {}}
