@@ -310,7 +310,7 @@ class TestRoutedExperts:
         assert manager.routed_experts is None
 
     def test_single_chunk(self):
-        """Single chunk round-trips through base64 correctly."""
+        """Single chunk: base64 decoded to raw bytes."""
         manager = TokenManager()
         experts = [0, 1, 2, 3]
         chunk = _make_routed_experts_b64(experts)
@@ -319,7 +319,8 @@ class TestRoutedExperts:
 
         result = manager.routed_experts
         assert result is not None
-        decoded = struct.unpack(f"<{len(experts)}i", base64.b64decode(result))
+        assert isinstance(result, bytes)
+        decoded = struct.unpack(f"<{len(experts)}i", result)
         assert list(decoded) == experts
 
     def test_multi_turn_overwrites(self):
@@ -337,7 +338,7 @@ class TestRoutedExperts:
         # Result should be turn 2's data only (overwrite, not concatenate)
         result = manager.routed_experts
         assert result is not None
-        decoded = struct.unpack(f"<{len(turn2_experts)}i", base64.b64decode(result))
+        decoded = struct.unpack(f"<{len(turn2_experts)}i", result)
         assert list(decoded) == turn2_experts
 
     def test_reset_then_reuse(self):
@@ -351,5 +352,5 @@ class TestRoutedExperts:
 
         result = manager.routed_experts
         assert result is not None
-        decoded = struct.unpack(f"<{len(new_experts)}i", base64.b64decode(result))
+        decoded = struct.unpack(f"<{len(new_experts)}i", result)
         assert list(decoded) == new_experts

@@ -22,7 +22,7 @@ For RL training, you typically want:
 - token_ids: Flat list of all tokens for the trajectory
 - loss_mask: Integer mask for loss computation (1 = model output, 0 = prompt/tool)
 - logprobs: Log probabilities for policy gradient
-- routed_experts: Base64-encoded MoE routing decisions for routing replay
+- routed_experts: Raw bytes of MoE routing decisions for routing replay
 """
 
 from __future__ import annotations
@@ -66,12 +66,12 @@ class TokenManager:
     def __init__(self) -> None:
         """Create a TokenManager."""
         self._segments: list[list[Token]] = []
-        self._routed_experts_data: str | None = None
+        self._routed_experts_bytes: bytes | None = None
 
     def reset(self) -> None:
         """Reset token accumulation for a new episode."""
         self._segments = []
-        self._routed_experts_data = None
+        self._routed_experts_bytes = None
 
     def add_prompt(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
         """Add a prompt segment (system messages, user input, tool results)."""
@@ -112,31 +112,34 @@ class TokenManager:
     def add_routed_experts(self, data: str) -> None:
         """Store routed experts from an SGLang response.
 
-        SGLang returns routed experts as a base64-encoded string of flattened
-        int32 values with shape ``[num_tokens, num_layers, top_k]``.  Each
-        response covers ALL tokens in the sequence (not just new tokens),
-        because SGLang does not support ``routed_experts_start_len``.
-        Therefore we overwrite rather than accumulate — the latest call
-        always has the complete routing for the full trajectory.
+        Decodes the base64 wire format and stores raw bytes. SGLang returns
+        routed experts as a base64-encoded string of flattened int32 values
+        with shape ``[num_tokens, num_layers, top_k]``.  Each response covers
+        ALL tokens in the sequence (not just new tokens), because SGLang does
+        not support ``routed_experts_start_len``. Therefore we overwrite rather
+        than accumulate — the latest call always has the complete routing.
 
         Args:
             data: Base64-encoded routed experts string from ``meta_info["routed_experts"]``.
         """
-        self._routed_experts_data = data
+        import base64
+
+        self._routed_experts_bytes = base64.b64decode(data)
 
     @property
-    def routed_experts(self) -> str | None:
-        """Get routed experts as a base64-encoded string.
+    def routed_experts(self) -> bytes | None:
+        """Get routed experts as raw bytes.
 
-        Returns the routing data from the most recent SGLang response,
-        which covers all ``seqlen - 1`` tokens in the trajectory.
+        Returns the decoded routing data from the most recent SGLang response,
+        which covers all ``seqlen - 1`` tokens in the trajectory. The bytes
+        contain flattened int32 expert IDs with logical shape
+        ``[total_tokens - 1, num_layers, top_k]``.
 
         Returns:
-            Base64-encoded string of int32 expert IDs with logical shape
-            ``[total_tokens - 1, num_layers, top_k]``, or ``None`` if no
-            routing data has been recorded.
+            Raw bytes of int32 expert IDs, or ``None`` if no routing data
+            has been recorded.
         """
-        return self._routed_experts_data
+        return self._routed_experts_bytes
 
     @property
     def tokens(self) -> list[Token]:

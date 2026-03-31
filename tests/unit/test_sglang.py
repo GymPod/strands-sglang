@@ -252,10 +252,9 @@ def _make_routing_b64(expert_ids: list[int]) -> str:
     return base64.b64encode(struct.pack(f"<{len(expert_ids)}i", *expert_ids)).decode("ascii")
 
 
-def _decode_routing_b64(data: str) -> list[int]:
-    """Decode base64 routing data back to int32 expert IDs."""
-    raw = base64.b64decode(data)
-    return list(struct.unpack(f"<{len(raw) // 4}i", raw))
+def _decode_routing(data: bytes) -> list[int]:
+    """Decode raw bytes routing data to int32 expert IDs."""
+    return list(struct.unpack(f"<{len(data) // 4}i", data))
 
 
 def _make_generate_response(
@@ -345,7 +344,7 @@ class TestRoutedExpertsE2E:
 
         routing = model.token_manager.routed_experts
         assert routing is not None
-        decoded = _decode_routing_b64(routing)
+        decoded = _decode_routing(routing)
         assert len(decoded) == 5 * EXPERTS_PER_TOKEN
 
         for pos in range(5):
@@ -425,7 +424,7 @@ class TestRoutedExpertsE2E:
         # Turn 2 returned routing for ALL 10 tokens (routing_start=0).
         routing = model.token_manager.routed_experts
         assert routing is not None
-        decoded = _decode_routing_b64(routing)
+        decoded = _decode_routing(routing)
         assert len(decoded) == total_tokens * EXPERTS_PER_TOKEN
 
         # Verify per-token expert IDs from turn 2's response
@@ -452,7 +451,7 @@ class TestRoutedExpertsE2E:
             await _collect_stream(model.stream(messages))
 
         n_tokens = len(model.token_manager.token_ids)
-        routing_entries = len(_decode_routing_b64(model.token_manager.routed_experts)) // EXPERTS_PER_TOKEN
+        routing_entries = len(_decode_routing(model.token_manager.routed_experts)) // EXPERTS_PER_TOKEN
 
         assert routing_entries == n_tokens
         assert len(model.token_manager.loss_mask) == n_tokens
