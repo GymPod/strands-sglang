@@ -1,0 +1,63 @@
+name: Claude PR Review
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+jobs:
+  claude-pr-auto:
+    if: github.event.pull_request.user.login != 'autonomy-claude-code[bot]'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-west-2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.BEDROCK_KEY }}
+          aws-secret-access-key: ${{ secrets.BEDROCK_SECRET_KEY }}
+          aws-region: us-west-2
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          allowed_bots: "autonomy-claude-code"
+          track_progress: true
+          prompt: |
+            Review this PR. Focus on:
+            1. Correctness of token management and routing replay logic
+            2. Backward compatibility with existing strands-agents consumers
+            3. Test coverage for edge cases
+            Post a summary comment and inline comments for any issues.
+          github_token: ${{ steps.app-token.outputs.token }}
+          use_bedrock: "true"
+          claude_args: |
+            --model global.anthropic.claude-opus-4-6-v1
+            --allowedTools mcp__github_inline_comment__create_inline_comment
+            --allowedTools "Bash(gh pr comment:*)"
+            --allowedTools "Bash(gh pr diff:*)"
+            --allowedTools "Bash(gh pr view:*)"
+            --allowedTools "Bash(gh api:*)"
+            --allowedTools "Bash(git log:*)"
+            --allowedTools "Bash(git show:*)"
+            --allowedTools Read
+            --allowedTools Glob
+            --allowedTools Grep
+            --allowedTools Task
