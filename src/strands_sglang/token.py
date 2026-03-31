@@ -27,6 +27,7 @@ For RL training, you typically want:
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 
 
@@ -141,8 +142,6 @@ class TokenManager:
             data: Base64-encoded routed experts string from
                 ``meta_info["routed_experts"]``.
         """
-        import base64
-
         self._routed_experts_bytes = base64.b64decode(data)
 
     @property
