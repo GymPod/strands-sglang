@@ -119,8 +119,27 @@ class TokenManager:
         not support ``routed_experts_start_len``. Therefore we overwrite rather
         than accumulate — the latest call always has the complete routing.
 
+        **Design tradeoffs (overwrite vs accumulate)**:
+
+        Current approach is *overwrite*: each call replaces all stored routing.
+        For single-turn rollouts, this is trivially correct. For multi-turn,
+        SGLang re-computes routing for the full sequence each turn. Within a
+        single episode (no weight update between turns), the MoE router is
+        deterministic — same weights + same tokens = same routing — so
+        overwriting produces identical results to accumulating.
+
+        If model weights update between turns (async RL), the re-computed
+        prefix routing reflects the new weights rather than the weights that
+        originally generated those tokens. An *accumulate* approach (keep
+        prior turns' routing, append only new tokens' portion) would preserve
+        per-token routing-logprob correspondence. This can be done client-side
+        by slicing at ``len(existing_bytes)`` without SGLang changes.
+        Overwrite is simpler and sufficient for the common case; accumulate
+        is a future optimization for long multi-turn async rollouts.
+
         Args:
-            data: Base64-encoded routed experts string from ``meta_info["routed_experts"]``.
+            data: Base64-encoded routed experts string from
+                ``meta_info["routed_experts"]``.
         """
         import base64
 
