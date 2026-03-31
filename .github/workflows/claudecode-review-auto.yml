@@ -1,4 +1,4 @@
-name: Claude PR Review
+name: Claude PR Review with Tracking
 
 permissions:
   contents: read
@@ -8,9 +8,10 @@ permissions:
 on:
   pull_request:
     types: [opened, ready_for_review, reopened]
-
+    
 jobs:
   claude-pr-auto:
+    # Skip review for auto-generated PRs from the docs updater workflow
     if: github.event.pull_request.user.login != 'autonomy-claude-code[bot]'
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -29,23 +30,21 @@ jobs:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (static)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.BEDROCK_KEY }}
           aws-secret-access-key: ${{ secrets.BEDROCK_SECRET_KEY }}
           aws-region: us-west-2
 
+      - name: Who am I
+        run: aws sts get-caller-identity
+          
       - uses: anthropics/claude-code-action@v1
         with:
           allowed_bots: "autonomy-claude-code"
           track_progress: true
-          prompt: |
-            Review this PR. Focus on:
-            1. Correctness of token management and routing replay logic
-            2. Backward compatibility with existing strands-agents consumers
-            3. Test coverage for edge cases
-            Post a summary comment and inline comments for any issues.
+          prompt: "/code-review-ci ${{ github.event.pull_request.html_url }}"
           github_token: ${{ steps.app-token.outputs.token }}
           use_bedrock: "true"
           claude_args: |
@@ -54,9 +53,12 @@ jobs:
             --allowedTools "Bash(gh pr comment:*)"
             --allowedTools "Bash(gh pr diff:*)"
             --allowedTools "Bash(gh pr view:*)"
+            --allowedTools "Bash(gh pr list:*)"
             --allowedTools "Bash(gh api:*)"
             --allowedTools "Bash(git log:*)"
+            --allowedTools "Bash(git blame:*)"
             --allowedTools "Bash(git show:*)"
+            --allowedTools "Bash(git rev-parse:*)"
             --allowedTools Read
             --allowedTools Glob
             --allowedTools Grep
