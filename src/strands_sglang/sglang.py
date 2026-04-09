@@ -276,6 +276,7 @@ class SGLangModel(Model):
                     hf_messages, tools=cast(list, tools), add_generation_prompt=True, **self._chat_template_kwargs
                 ),
             )
+            self._drop_unexpanded_images(prompt)
             return list(self.tokenizer.encode(prompt, add_special_tokens=False))
 
         # Incremental: fake prefix subtraction with message_separator bridge
@@ -295,6 +296,7 @@ class SGLangModel(Model):
                     fake_hf_messages + new_hf_messages, add_generation_prompt=True, **self._chat_template_kwargs
                 ),
             )
+            self._drop_unexpanded_images(full_prompt)
             prefix_prompt = cast(
                 str,
                 self.tokenizer.apply_chat_template(
@@ -306,6 +308,29 @@ class SGLangModel(Model):
             return list(self.tokenizer.encode(prompt, add_special_tokens=False))
 
         raise RuntimeError(f"No new messages to tokenize (message_count={self.message_count}, got {len(messages)})")
+
+    def _drop_unexpanded_images(self, template_output: str) -> None:
+        """Remove images whose data URLs survive in the chat template output.
+
+        When a chat template expands an image, it *consumes* the data URL and
+        replaces it with model-specific vision tokens (e.g. ``<|vision_start|>``).
+        If a data URL appears verbatim in the rendered string, the template did
+        not generate placeholder tokens for it and SGLang will warn about more
+        image data items than corresponding tokens.  Drop those entries so the
+        positional mapping stays correct.
+        """
+        if not self.image_data:
+            return
+        kept = [img for img in self.image_data if img not in template_output]
+        n_dropped = len(self.image_data) - len(kept)
+        if n_dropped:
+            logger.warning(
+                "Dropped %d/%d images whose data URLs were not expanded by the chat template "
+                "(likely images in message roles the template does not support)",
+                n_dropped,
+                len(self.image_data),
+            )
+            self.image_data = kept
 
     # -------------------------------------------------------------------------
     # Generation
