@@ -234,6 +234,30 @@ class TestImageAccumulation:
         vlm_model.reset()
         assert vlm_model.image_data == []
 
+    def test_unexpanded_images_dropped(self, vlm_model, mock_tokenizer):
+        """Images whose data URLs survive in the template output are dropped.
+
+        When the chat template does not expand an image (e.g. images in tool
+        results for templates that only support user-role images), the data URL
+        appears verbatim in the output string. These images have no
+        corresponding placeholder tokens, so they must be removed from
+        image_data to avoid the SGLang 'more image data items than tokens'
+        warning.
+        """
+        # Template output that contains the data URL verbatim = template did NOT expand it
+        mock_tokenizer.apply_chat_template.return_value = f"tool result: {_RED_PIXEL_DATA_URL}"
+        messages = [{"role": "user", "content": [{"text": "describe"}, _image_block()]}]
+        vlm_model.tokenize_prompt_messages(messages, system_prompt=None, is_multimodal=True)
+        assert len(vlm_model.image_data) == 0, "unexpanded image should be dropped"
+
+    def test_expanded_images_kept(self, vlm_model, mock_tokenizer):
+        """Images expanded by the template (data URL consumed) are kept."""
+        # Template output with vision tokens instead of the data URL = template DID expand it
+        mock_tokenizer.apply_chat_template.return_value = "<|vision_start|><|image_pad|><|vision_end|>describe"
+        messages = [{"role": "user", "content": [{"text": "describe"}, _image_block()]}]
+        vlm_model.tokenize_prompt_messages(messages, system_prompt=None, is_multimodal=True)
+        assert len(vlm_model.image_data) == 1, "expanded image should be kept"
+
 
 # ---------------------------------------------------------------------------
 # stream() — image_data forwarding
