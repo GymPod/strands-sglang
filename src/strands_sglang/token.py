@@ -16,7 +16,7 @@
 
 This module provides:
 - Token: A single token with ID, logprob, and loss mask
-- TokenTrajectory: A grouped token trajectory after any context rewrites
+- TokenTrajectory: A token trajectory after any context rewrites
 - TokenManager: Manages segment-based prompt/response tracking and trajectory boundaries
 
 For RL training, you typically want:
@@ -24,7 +24,7 @@ For RL training, you typically want:
 - loss_mask: Integer mask for loss computation (1 = model output, 0 = prompt/tool)
 - logprobs: Log probabilities for policy gradient
 - routed_experts: Raw bytes of MoE routing decisions for routing replay
-- trajectories: Grouped token trajectories split whenever managed context stops
+- trajectories: Token trajectories split whenever managed context stops
   extending the previous active prompt+response
 """
 
@@ -45,7 +45,7 @@ class Token:
 
 @dataclass(frozen=True, slots=True)
 class TokenTrajectory:
-    """A grouped token trajectory tracked inside ``TokenManager``.
+    """A token trajectory tracked inside ``TokenManager``.
 
     Attributes:
         trajectory_id: Zero-based trajectory index within the rollout.
@@ -208,19 +208,19 @@ class TokenManager:
 
     @property
     def trajectory_start_segment_indices(self) -> list[int]:
-        """Get segment indices where each grouped trajectory begins."""
+        """Get segment indices where each trajectory begins."""
         if not self._segments:
             return []
         return [0, *self._trajectory_start_segment_indices]
 
     @property
     def turn_trajectory_ids(self) -> list[int]:
-        """Get the grouped trajectory ID for each response/model turn."""
+        """Get the trajectory ID for each response/model turn."""
         return list(self._turn_trajectory_ids)
 
     @property
     def trajectories(self) -> list[TokenTrajectory]:
-        """Get grouped token trajectories split by managed-context rewrites."""
+        """Get token trajectories split by managed-context rewrites."""
         if not self._segments:
             return []
 
