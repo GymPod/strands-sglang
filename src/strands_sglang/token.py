@@ -16,13 +16,16 @@
 
 This module provides:
 - Token: A single token with ID, logprob, and loss mask
-- TokenManager: Manages segment-based token accumulation
+- TokenTrajectory: A grouped token trajectory after any context rewrites
+- TokenManager: Manages segment-based prompt/response tracking and trajectory boundaries
 
 For RL training, you typically want:
-- token_ids: Flat list of all tokens for the trajectory
+- token_ids: Flat list of all tokens for the rollout
 - loss_mask: Integer mask for loss computation (1 = model output, 0 = prompt/tool)
 - logprobs: Log probabilities for policy gradient
 - routed_experts: Raw bytes of MoE routing decisions for routing replay
+- trajectories: Grouped token trajectories split whenever managed context stops
+  extending the previous active prompt+response
 """
 
 from __future__ import annotations
@@ -40,39 +43,76 @@ class Token:
     loss_mask: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class TokenTrajectory:
+    """A grouped token trajectory tracked inside ``TokenManager``.
+
+    Attributes:
+        trajectory_id: Zero-based trajectory index within the rollout.
+        token_ids: Flattened token IDs for this trajectory.
+        logprobs: Flattened per-token log probabilities (prompt tokens may be ``None``).
+        loss_mask: Integer mask aligned to ``token_ids``.
+        segment_info: Segment metadata as ``(is_output, length)`` tuples.
+        token_offset: Global starting token offset within the full rollout token stream.
+    """
+
+    trajectory_id: int
+    token_ids: list[int]
+    logprobs: list[float | None]
+    loss_mask: list[int]
+    segment_info: list[tuple[bool, int]]
+    token_offset: int
+
+
 class TokenManager:
     """Manages token accumulation with segment-based prompt/response tracking.
 
     Notes:
-        - Tokens are organized into `segments`, where each segment is either:
-            - `PROMPT`: System messages, user input, tool results (loss_mask=False)
-            - `RESPONSE`: Model outputs (loss_mask=True)
-        - During an agent loop with the `SGLangModel` backend, segments are added in this order:
-            - `segments[0]`: `PROMPT`   — initial prompt (system + tools + user message / conversation history)
-            - `segments[1]`: `RESPONSE` — first model output (may include tool calls)
-            - `segments[2]`: `PROMPT`   — tool results (if tool use occurred)
-            - `segments[3]`: `RESPONSE` — next model output
-            - ...                   — alternating `PROMPT`/`RESPONSE` until the loop ends
-        - `segments[0]` always contains the full initial prompt from the first generation call. Everything after it is the rollout.
-
-    Example:
-        >>> manager = TokenManager()
-        >>> manager.add_prompt([1, 2, 3])
-        >>> manager.add_response([4, 5], [0.1, 0.2])
-        >>> manager.token_ids      # [1, 2, 3, 4, 5]
-        >>> manager.loss_mask      # [0, 0, 0, 1, 1]
-        >>> manager.logprobs       # [None, None, None, 0.1, 0.2]
+        - Tokens are organized into ``segments``, where each segment is either:
+            - ``PROMPT``: System messages, user input, tool results (loss_mask=False)
+            - ``RESPONSE``: Model outputs (loss_mask=True)
+        - During an agent loop with the ``SGLangModel`` backend, segments are added in this order:
+            - ``segments[0]``: ``PROMPT``   — initial prompt
+            - ``segments[1]``: ``RESPONSE`` — first model output
+            - ``segments[2]``: ``PROMPT``   — tool results or managed prompt delta
+            - ``segments[3]``: ``RESPONSE`` — next model output
+            - ... alternating ``PROMPT``/``RESPONSE`` until the loop ends
+        - ``start_new_trajectory()`` marks that the next segment begins a new
+          training trajectory because prompt context was rewritten rather than
+          extended additively.
     """
 
     def __init__(self) -> None:
         """Create a TokenManager."""
         self._segments: list[list[Token]] = []
         self._routed_experts_bytes: bytes | None = None
+        self._trajectory_start_segment_indices: list[int] = []
+        self._turn_trajectory_ids: list[int] = []
 
     def reset(self) -> None:
         """Reset token accumulation for a new episode."""
         self._segments = []
         self._routed_experts_bytes = None
+        self._trajectory_start_segment_indices = []
+        self._turn_trajectory_ids = []
+
+    def start_new_trajectory(self) -> None:
+        """Mark the next segment as the start of a new training trajectory.
+
+        This should be called when the visible prompt sent to the model no
+        longer prefix-extends the previous active prompt+response context.
+        """
+        if not self._segments:
+            return
+        next_start = len(self._segments)
+        if self._trajectory_start_segment_indices and self._trajectory_start_segment_indices[-1] == next_start:
+            return
+        self._trajectory_start_segment_indices.append(next_start)
+
+    @property
+    def current_trajectory_id(self) -> int:
+        """Get the trajectory ID that new segments belong to."""
+        return len(self._trajectory_start_segment_indices)
 
     def add_prompt(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
         """Add a prompt segment (system messages, user input, tool results)."""
@@ -109,34 +149,16 @@ class TokenManager:
             for i, tid in enumerate(token_ids)
         ]
         self._segments.append(tokens)
+        self._turn_trajectory_ids.append(self.current_trajectory_id)
 
     def add_routed_experts(self, data: str) -> None:
         """Store routed experts from an SGLang response.
 
         Decodes the base64 wire format and stores raw bytes. SGLang returns
         routed experts as a base64-encoded string of flattened int32 values
-        with shape ``[num_tokens, num_layers, top_k]``.  Each response covers
-        ALL tokens in the sequence (not just new tokens), because SGLang does
-        not support ``routed_experts_start_len``. Therefore we overwrite rather
-        than accumulate — the latest call always has the complete routing.
-
-        **Design tradeoffs (overwrite vs accumulate)**:
-
-        Current approach is *overwrite*: each call replaces all stored routing.
-        For single-turn rollouts, this is trivially correct. For multi-turn,
-        SGLang re-computes routing for the full sequence each turn. Within a
-        single episode (no weight update between turns), the MoE router is
-        deterministic — same weights + same tokens = same routing — so
-        overwriting produces identical results to accumulating.
-
-        If model weights update between turns (async RL), the re-computed
-        prefix routing reflects the new weights rather than the weights that
-        originally generated those tokens. An *accumulate* approach (keep
-        prior turns' routing, append only new tokens' portion) would preserve
-        per-token routing-logprob correspondence. This can be done client-side
-        by slicing at ``len(existing_bytes)`` without SGLang changes.
-        Overwrite is simpler and sufficient for the common case; accumulate
-        is a future optimization for long multi-turn async rollouts.
+        with shape ``[num_tokens, num_layers, top_k]``. Each response covers
+        ALL tokens in the sequence, so the latest call always overwrites the
+        stored routing view.
 
         Args:
             data: Base64-encoded routed experts string from
@@ -146,17 +168,7 @@ class TokenManager:
 
     @property
     def routed_experts(self) -> bytes | None:
-        """Get routed experts as raw bytes.
-
-        Returns the decoded routing data from the most recent SGLang response,
-        which covers all ``seqlen - 1`` tokens in the trajectory. The bytes
-        contain flattened int32 expert IDs with logical shape
-        ``[total_tokens - 1, num_layers, top_k]``.
-
-        Returns:
-            Raw bytes of int32 expert IDs, or ``None`` if no routing data
-            has been recorded.
-        """
+        """Get routed experts as raw bytes."""
         return self._routed_experts_bytes
 
     @property
@@ -171,11 +183,7 @@ class TokenManager:
 
     @property
     def loss_mask(self) -> list[int]:
-        """Get loss mask for all tokens (1 = model output, 0 = prompt/tool).
-
-        Notes:
-            Only compute loss on tokens where mask is 1 (model outputs).
-        """
+        """Get loss mask for all tokens (1 = model output, 0 = prompt/tool)."""
         return [int(token.loss_mask) for token in self.tokens]
 
     @property
@@ -185,12 +193,7 @@ class TokenManager:
 
     @property
     def initial_prompt(self) -> list[Token]:
-        """Get the initial prompt tokens (`segments[0]`).
-
-        Notes:
-            Contains the full input context from the first generation call:
-            system prompt + tool definitions + user message (or conversation history).
-        """
+        """Get the initial prompt tokens (``segments[0]``)."""
         return self._segments[0] if self._segments else []
 
     @property
@@ -200,8 +203,47 @@ class TokenManager:
 
     @property
     def segment_info(self) -> list[tuple[bool, int]]:
-        """Get segment metadata as `(is_output, length)` tuples."""
+        """Get segment metadata as ``(is_output, length)`` tuples."""
         return [(seg[0].loss_mask if seg else False, len(seg)) for seg in self._segments]
+
+    @property
+    def trajectory_start_segment_indices(self) -> list[int]:
+        """Get segment indices where each grouped trajectory begins."""
+        if not self._segments:
+            return []
+        return [0, *self._trajectory_start_segment_indices]
+
+    @property
+    def turn_trajectory_ids(self) -> list[int]:
+        """Get the grouped trajectory ID for each response/model turn."""
+        return list(self._turn_trajectory_ids)
+
+    @property
+    def trajectories(self) -> list[TokenTrajectory]:
+        """Get grouped token trajectories split by managed-context rewrites."""
+        if not self._segments:
+            return []
+
+        starts = self.trajectory_start_segment_indices
+        ends = starts[1:] + [len(self._segments)]
+        trajectories: list[TokenTrajectory] = []
+        token_offset = 0
+
+        for trajectory_id, (segment_start, segment_end) in enumerate(zip(starts, ends, strict=True)):
+            segment_slice = self._segments[segment_start:segment_end]
+            tokens = [token for segment in segment_slice for token in segment]
+            trajectories.append(
+                TokenTrajectory(
+                    trajectory_id=trajectory_id,
+                    token_ids=[token.token_id for token in tokens],
+                    logprobs=[token.logprob for token in tokens],
+                    loss_mask=[int(token.loss_mask) for token in tokens],
+                    segment_info=[(segment[0].loss_mask if segment else False, len(segment)) for segment in segment_slice],
+                    token_offset=token_offset,
+                )
+            )
+            token_offset += len(tokens)
+        return trajectories
 
     def __len__(self) -> int:
         """Return total number of tokens."""

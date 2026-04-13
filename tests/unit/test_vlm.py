@@ -191,17 +191,21 @@ class TestFormatMessagesMultimodal:
 
 
 class TestImageAccumulation:
-    def test_images_accumulated_across_calls(self, vlm_model, mock_tokenizer):
-        """image_data grows across multiple tokenize_prompt_messages calls."""
-        # First turn: one image
-        messages1 = [{"role": "user", "content": [{"text": "describe"}, _image_block()]}]
-        vlm_model.tokenize_prompt_messages(messages1, system_prompt=None, is_multimodal=True)
-        assert len(vlm_model.image_data) == 1
+    def test_text_only_server_still_formats_image_prompts_multimodally(self, text_model, mock_tokenizer):
+        """Prompt images override a stale text-only server probe."""
+        messages = [{"role": "user", "content": [{"text": "describe"}, _image_block()]}]
 
-        # Second turn: simulate assistant response + tool result with screenshot
-        vlm_model.token_manager.add_prompt([10, 20, 30])
-        vlm_model.message_count = 2  # len([user_msg]) + 1 after first generation
-        messages2 = [
+        token_ids = text_model.tokenize_prompt_messages(messages, system_prompt=None, is_multimodal=False)
+
+        assert token_ids == [1, 2, 3]
+        rendered_messages = mock_tokenizer.apply_chat_template.call_args.args[0]
+        assert rendered_messages == [
+            {"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image", "image": _RED_PIXEL_DATA_URL}]}
+        ]
+
+    def test_prepare_prompt_messages_tracks_current_prompt_images(self, vlm_model, mock_tokenizer):
+        """Prepared prompt image data should reflect the current visible prompt, not historical accumulation."""
+        messages = [
             {"role": "user", "content": [{"text": "describe"}, _image_block()]},
             {
                 "role": "assistant",
@@ -223,40 +227,35 @@ class TestImageAccumulation:
                 ],
             },
         ]
-        vlm_model.tokenize_prompt_messages(messages2, system_prompt=None, is_multimodal=True)
-        assert len(vlm_model.image_data) == 2  # 1 from first + 1 from second (tool result image)
 
-    def test_reset_clears_accumulated_images(self, vlm_model, mock_tokenizer):
-        messages = [{"role": "user", "content": [{"text": "describe"}, _image_block()]}]
-        vlm_model.tokenize_prompt_messages(messages, system_prompt=None, is_multimodal=True)
-        assert len(vlm_model.image_data) > 0
+        prepared = vlm_model._prepare_prompt_messages(messages, system_prompt=None, tool_specs=None, is_multimodal=True)
+
+        assert prepared.image_data == [_RED_PIXEL_DATA_URL, _RED_PIXEL_DATA_URL]
+        assert vlm_model.image_data == []
+
+    def test_reset_clears_current_image_state(self, vlm_model, mock_tokenizer):
+        vlm_model.image_data = [_RED_PIXEL_DATA_URL]
 
         vlm_model.reset()
         assert vlm_model.image_data == []
 
     def test_unexpanded_images_dropped(self, vlm_model, mock_tokenizer):
-        """Images whose data URLs survive in the template output are dropped.
-
-        When the chat template does not expand an image (e.g. images in tool
-        results for templates that only support user-role images), the data URL
-        appears verbatim in the output string. These images have no
-        corresponding placeholder tokens, so they must be removed from
-        image_data to avoid the SGLang 'more image data items than tokens'
-        warning.
-        """
-        # Template output that contains the data URL verbatim = template did NOT expand it
+        """Images whose data URLs survive in the template output are dropped."""
         mock_tokenizer.apply_chat_template.return_value = f"tool result: {_RED_PIXEL_DATA_URL}"
         messages = [{"role": "user", "content": [{"text": "describe"}, _image_block()]}]
-        vlm_model.tokenize_prompt_messages(messages, system_prompt=None, is_multimodal=True)
-        assert len(vlm_model.image_data) == 0, "unexpanded image should be dropped"
+
+        prepared = vlm_model._prepare_prompt_messages(messages, system_prompt=None, tool_specs=None, is_multimodal=True)
+
+        assert prepared.image_data == []
 
     def test_expanded_images_kept(self, vlm_model, mock_tokenizer):
         """Images expanded by the template (data URL consumed) are kept."""
-        # Template output with vision tokens instead of the data URL = template DID expand it
         mock_tokenizer.apply_chat_template.return_value = "<|vision_start|><|image_pad|><|vision_end|>describe"
         messages = [{"role": "user", "content": [{"text": "describe"}, _image_block()]}]
-        vlm_model.tokenize_prompt_messages(messages, system_prompt=None, is_multimodal=True)
-        assert len(vlm_model.image_data) == 1, "expanded image should be kept"
+
+        prepared = vlm_model._prepare_prompt_messages(messages, system_prompt=None, tool_specs=None, is_multimodal=True)
+
+        assert prepared.image_data == [_RED_PIXEL_DATA_URL]
 
 
 # ---------------------------------------------------------------------------

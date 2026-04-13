@@ -136,12 +136,12 @@ class TestFormatMessages:
 
 
 class TestTokenizePromptMessages:
-    """Tests for tokenize_prompt_messages error handling."""
+    """Tests for tokenize_prompt_messages prompt-state behavior."""
 
-    def test_no_new_messages_raises(self, model):
-        """Raises RuntimeError when message_count matches input length."""
-        model.token_manager.add_prompt([1, 2, 3])
-        model.message_count = 2
+    def test_no_new_messages_raises(self, model, mock_tokenizer):
+        """Raises RuntimeError when the prompt is unchanged."""
+        model._active_input_ids = [1, 2, 3]
+        mock_tokenizer.encode.return_value = [1, 2, 3]
 
         messages = [
             {"role": "user", "content": [{"text": "Hello"}]},
@@ -150,6 +150,30 @@ class TestTokenizePromptMessages:
 
         with pytest.raises(RuntimeError, match="No new messages to tokenize"):
             model.tokenize_prompt_messages(messages, system_prompt=None)
+
+    def test_additive_prompt_returns_incremental_suffix(self, model, mock_tokenizer):
+        """Continuation prompts only return the suffix beyond the active context."""
+        model._active_input_ids = [10, 11]
+        mock_tokenizer.encode.return_value = [10, 11, 12, 13]
+
+        token_ids = model.tokenize_prompt_messages(
+            [{"role": "user", "content": [{"text": "Continue"}]}],
+            system_prompt=None,
+        )
+
+        assert token_ids == [12, 13]
+
+    def test_context_reset_returns_full_prompt(self, model, mock_tokenizer):
+        """Compressed/reset prompts are re-tokenized from full current context."""
+        model._active_input_ids = [10, 11, 12]
+        mock_tokenizer.encode.return_value = [90, 91]
+
+        token_ids = model.tokenize_prompt_messages(
+            [{"role": "user", "content": [{"text": "Summary"}]}],
+            system_prompt=None,
+        )
+
+        assert token_ids == [90, 91]
 
 
 class TestSortToolResults:
@@ -236,6 +260,86 @@ class TestStreamDefaults:
 
         call_kwargs = client.generate.call_args
         assert call_kwargs.kwargs["sampling_params"]["skip_special_tokens"] is False
+
+    async def test_stream_uses_full_prompt_after_context_reset(self, mock_tokenizer):
+        """A context reset sends the new full prompt, not the old trajectory prefix."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            return_value={
+                "text": "reset",
+                "output_ids": [7],
+                "meta_info": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    "e2e_latency": 0.1,
+                    "input_token_logprobs": [[-0.1], [-0.2]],
+                    "output_token_logprobs": [[-0.3]],
+                },
+            }
+        )
+        mock_tokenizer.encode.return_value = [41, 42]
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model._active_input_ids = [10, 11, 12]
+
+        messages = [{"role": "user", "content": [{"text": "compressed summary"}]}]
+        async for _ in model.stream(messages):
+            pass
+
+        call_kwargs = client.generate.call_args
+        assert call_kwargs.kwargs["input_ids"] == [41, 42]
+        assert call_kwargs.kwargs["logprob_start_len"] == 0
+        assert model.token_manager.turn_trajectory_ids == [0]
+        assert len(model.token_manager.trajectories) == 1
+
+    async def test_stream_marks_new_trajectory_after_context_reset(self, mock_tokenizer):
+        """A non-prefix prompt reset should start a new grouped trajectory."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                {
+                    "text": "first",
+                    "output_ids": [13],
+                    "meta_info": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop"},
+                        "e2e_latency": 0.1,
+                        "input_token_logprobs": [[-0.1], [-0.2]],
+                        "output_token_logprobs": [[-0.3]],
+                    },
+                },
+                {
+                    "text": "second",
+                    "output_ids": [91],
+                    "meta_info": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop"},
+                        "e2e_latency": 0.1,
+                        "input_token_logprobs": [[-0.4], [-0.5]],
+                        "output_token_logprobs": [[-0.6]],
+                    },
+                },
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [[11, 12], [41, 42]]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "first"}]}]):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "summary"}]}]):
+            pass
+
+        assert model.token_manager.turn_trajectory_ids == [0, 1]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [[11, 12, 13], [41, 42, 91]]
 
 
 # ---------------------------------------------------------------------------

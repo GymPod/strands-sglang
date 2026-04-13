@@ -19,7 +19,7 @@ import struct
 
 import pytest
 
-from strands_sglang import Token, TokenManager
+from strands_sglang import Token, TokenManager, TokenTrajectory
 
 
 class TestToken:
@@ -50,6 +50,8 @@ class TestTokenManagerBasic:
         assert manager.logprobs == []
         assert manager.segments == []
         assert manager.segment_info == []
+        assert manager.turn_trajectory_ids == []
+        assert manager.trajectories == []
 
 
 class TestTokenManagerAddPrompt:
@@ -155,6 +157,7 @@ class TestTokenManagerMultipleSegments:
         assert manager.token_ids == [1, 2, 3, 4, 5, 6, 7, 8]
         assert manager.loss_mask == [False, False, True, True, False, False, True, True]
         assert manager.logprobs == [None, None, -0.1, -0.2, None, None, -0.3, -0.4]
+        assert manager.turn_trajectory_ids == [0, 0]
         assert len(manager) == 8
 
     def test_segments_property(self):
@@ -354,3 +357,49 @@ class TestRoutedExperts:
         assert result is not None
         decoded = struct.unpack(f"<{len(new_experts)}i", result)
         assert list(decoded) == new_experts
+
+
+class TestTokenManagerTrajectories:
+    """Tests for grouped trajectory tracking."""
+
+    def test_start_new_trajectory_splits_grouped_tokens(self) -> None:
+        """Managed context resets should start a new grouped trajectory."""
+        manager = TokenManager()
+        manager.add_prompt([1, 2])
+        manager.add_response([3], logprobs=[-0.1])
+        manager.add_prompt([4])
+        manager.add_response([5], logprobs=[-0.2])
+
+        manager.start_new_trajectory()
+        manager.add_prompt([9, 10])
+        manager.add_response([11], logprobs=[-0.3])
+
+        assert manager.turn_trajectory_ids == [0, 0, 1]
+        assert manager.trajectory_start_segment_indices == [0, 4]
+        assert manager.trajectories == [
+            TokenTrajectory(
+                trajectory_id=0,
+                token_ids=[1, 2, 3, 4, 5],
+                logprobs=[None, None, -0.1, None, -0.2],
+                loss_mask=[0, 0, 1, 0, 1],
+                segment_info=[(False, 2), (True, 1), (False, 1), (True, 1)],
+                token_offset=0,
+            ),
+            TokenTrajectory(
+                trajectory_id=1,
+                token_ids=[9, 10, 11],
+                logprobs=[None, None, -0.3],
+                loss_mask=[0, 0, 1],
+                segment_info=[(False, 2), (True, 1)],
+                token_offset=5,
+            ),
+        ]
+
+    def test_start_new_trajectory_before_tokens_is_noop(self) -> None:
+        """Starting a new trajectory before any segments exist should do nothing."""
+        manager = TokenManager()
+
+        manager.start_new_trajectory()
+
+        assert manager.trajectory_start_segment_indices == []
+        assert manager.trajectories == []
