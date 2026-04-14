@@ -41,6 +41,7 @@ class TestSGLangClientInit:
         assert client.base_url == "http://localhost:30000"
         assert client.max_retries == 60
         assert client.retry_delay == 1.0
+        assert client._sessions == {}
 
     def test_base_url_strips_trailing_slash(self):
         """Base URL trailing slash is stripped."""
@@ -72,6 +73,8 @@ class TestGetSession:
 
         session = client._get_session()
         assert session is not None
+        assert client._session is session
+        assert len(client._sessions) == 1
 
     async def test_reuses_session_on_subsequent_calls(self):
         """Subsequent calls return the same session."""
@@ -79,18 +82,40 @@ class TestGetSession:
         session1 = client._get_session()
         session2 = client._get_session()
         assert session1 is session2
+        assert len(client._sessions) == 1
 
     async def test_recreates_session_when_closed(self):
         """Session is recreated when explicitly closed."""
         client = SGLangClient(base_url="http://localhost:30000")
+        current_loop = asyncio.get_running_loop()
 
         mock_session = MagicMock()
         mock_session.closed = True
 
         client._session = mock_session
+        client._sessions[current_loop] = mock_session
 
         new_session = client._get_session()
         assert new_session is not mock_session
+
+    def test_creates_distinct_sessions_per_event_loop(self):
+        """Different event loops should receive different aiohttp sessions."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        loop_a = MagicMock()
+        loop_b = MagicMock()
+        session_a = MagicMock()
+        session_a.closed = False
+        session_b = MagicMock()
+        session_b.closed = False
+
+        with patch("strands_sglang.client.asyncio.get_running_loop", side_effect=[loop_a, loop_a, loop_b, loop_b]):
+            with patch("strands_sglang.client.aiohttp.ClientSession", side_effect=[session_a, session_b]):
+                first = client._get_session()
+                second = client._get_session()
+
+        assert first is session_a
+        assert second is session_b
+        assert client._sessions == {loop_a: session_a, loop_b: session_b}
 
 
 class TestClassifyHTTPError:
