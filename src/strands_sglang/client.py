@@ -105,7 +105,6 @@ class SGLangClient:
         self._timeout = timeout
         self._connect_timeout = connect_timeout
         self._session: aiohttp.ClientSession | None = None
-        self._sessions: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
         self._is_multimodal: bool | None = None
 
         logger.info(
@@ -117,44 +116,27 @@ class SGLangClient:
         )
 
     def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create the aiohttp session for the current event loop."""
-        loop = asyncio.get_running_loop()
-        session = self._sessions.get(loop)
-        if session is None or session.closed:
-            session = aiohttp.ClientSession(
+        """Get or create the aiohttp session (lazy initialization)."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
                 base_url=self.base_url,
                 timeout=aiohttp.ClientTimeout(total=self._timeout, connect=self._connect_timeout),
                 connector=aiohttp.TCPConnector(limit=self._max_connections),
             )
-            self._sessions[loop] = session
-        self._session = session
-        return session
-
-    @staticmethod
-    def _close_session_sync(session: aiohttp.ClientSession) -> None:
-        """Synchronously close a session without relying on its original event loop."""
-        if session.connector is not None and not session.connector.closed:
-            session.connector._close()
-        session._connector = None
+        return self._session
 
     async def close(self) -> None:
         """Close the HTTP client and release connections."""
-        current_loop = asyncio.get_running_loop()
-        for loop, session in list(self._sessions.items()):
-            if session.closed:
-                continue
-            if loop is current_loop:
-                await session.close()
-            else:
-                self._close_session_sync(session)
-        self._sessions.clear()
-        self._session = None
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     def __del__(self) -> None:
         """Sync cleanup to prevent aiohttp 'Unclosed client session' warnings at shutdown."""
-        for session in self._sessions.values():
-            if session is not None and not session.closed:
-                self._close_session_sync(session)
+        if self._session is not None and not self._session.closed:
+            if self._session.connector is not None and not self._session.connector.closed:
+                self._session.connector._close()
+            self._session._connector = None
 
     async def __aenter__(self) -> SGLangClient:
         """Enter async context manager."""

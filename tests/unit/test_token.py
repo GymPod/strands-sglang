@@ -19,7 +19,8 @@ import struct
 
 import pytest
 
-from strands_sglang import Token, TokenManager, TokenTrajectory
+from strands_sglang import Token, TokenManager
+from strands_sglang.token import TokenTrajectory
 
 
 class TestToken:

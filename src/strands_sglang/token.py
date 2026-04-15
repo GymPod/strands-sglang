@@ -238,7 +238,9 @@ class TokenManager:
                     token_ids=[token.token_id for token in tokens],
                     logprobs=[token.logprob for token in tokens],
                     loss_mask=[int(token.loss_mask) for token in tokens],
-                    segment_info=[(segment[0].loss_mask if segment else False, len(segment)) for segment in segment_slice],
+                    segment_info=[
+                        (segment[0].loss_mask if segment else False, len(segment)) for segment in segment_slice
+                    ],
                     token_offset=token_offset,
                 )
             )

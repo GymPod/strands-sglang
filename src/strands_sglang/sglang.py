@@ -396,24 +396,6 @@ class SGLangModel(Model):
             )
         return kept
 
-    def _decode_response_text(self, response: dict[str, Any]) -> str:
-        """Decode response text when the server omits the textual field."""
-        text = response.get("text")
-        if isinstance(text, str):
-            return text
-
-        output_ids = response.get("output_ids")
-        if not isinstance(output_ids, list) or not all(isinstance(token_id, int) for token_id in output_ids):
-            raise KeyError("SGLang response must include text or output_ids")
-
-        decoded = self.tokenizer.decode(output_ids, skip_special_tokens=False)
-        if "</think>" in decoded and not decoded.lstrip().startswith("<think>"):
-            decoded = "<think>" + decoded
-        decoded = decoded.rstrip()
-        if decoded.endswith("<|im_end|>"):
-            decoded = decoded[: -len("<|im_end|>")].rstrip()
-        return decoded
-
     # -------------------------------------------------------------------------
     # Generation
     # -------------------------------------------------------------------------
@@ -467,7 +449,7 @@ class SGLangModel(Model):
             )
 
             # Extract response data
-            text = self._decode_response_text(response)
+            text = response["text"]
             output_ids = response["output_ids"]
             meta_info = response["meta_info"]
             input_token_logprobs = meta_info.get("input_token_logprobs")
@@ -600,7 +582,7 @@ class SGLangModel(Model):
             raise ModelThrottledException(f"Service throttled (status={e.status}): {e.body}") from e
 
         # Parse and validate response
-        text = self._decode_response_text(response)
+        text = response["text"]
         parsed = output_model.model_validate_json(text)
 
         yield {"output": parsed}
