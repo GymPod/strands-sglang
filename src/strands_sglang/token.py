@@ -68,18 +68,27 @@ class TokenManager:
     """Manages token accumulation with segment-based prompt/response tracking.
 
     Notes:
-        - Tokens are organized into ``segments``, where each segment is either:
-            - ``PROMPT``: System messages, user input, tool results (loss_mask=False)
-            - ``RESPONSE``: Model outputs (loss_mask=True)
-        - During an agent loop with the ``SGLangModel`` backend, segments are added in this order:
-            - ``segments[0]``: ``PROMPT``   — initial prompt
-            - ``segments[1]``: ``RESPONSE`` — first model output
-            - ``segments[2]``: ``PROMPT``   — tool results or managed prompt delta
-            - ``segments[3]``: ``RESPONSE`` — next model output
-            - ... alternating ``PROMPT``/``RESPONSE`` until the loop ends
-        - ``start_new_trajectory()`` marks that the next segment begins a new
+        - Tokens are organized into `segments`, where each segment is either:
+            - `PROMPT`: System messages, user input, tool results (loss_mask=False)
+            - `RESPONSE`: Model outputs (loss_mask=True)
+        - During an agent loop with the `SGLangModel` backend, segments are added in this order:
+            - `segments[0]`: `PROMPT`   — initial prompt (system + tools + user message / conversation history)
+            - `segments[1]`: `RESPONSE` — first model output (may include tool calls)
+            - `segments[2]`: `PROMPT`   — tool results (if tool use occurred) or managed prompt delta
+            - `segments[3]`: `RESPONSE` — next model output
+            - ...                   — alternating `PROMPT`/`RESPONSE` until the loop ends
+        - `segments[0]` always contains the full initial prompt from the first generation call.
+        - `start_new_trajectory()` marks that the next segment begins a new
           training trajectory because prompt context was rewritten rather than
           extended additively.
+
+    Example:
+        >>> manager = TokenManager()
+        >>> manager.add_prompt([1, 2, 3])
+        >>> manager.add_response([4, 5], [0.1, 0.2])
+        >>> manager.token_ids      # [1, 2, 3, 4, 5]
+        >>> manager.loss_mask      # [0, 0, 0, 1, 1]
+        >>> manager.logprobs       # [None, None, None, 0.1, 0.2]
     """
 
     def __init__(self) -> None:
@@ -156,9 +165,28 @@ class TokenManager:
 
         Decodes the base64 wire format and stores raw bytes. SGLang returns
         routed experts as a base64-encoded string of flattened int32 values
-        with shape ``[num_tokens, num_layers, top_k]``. Each response covers
-        ALL tokens in the sequence, so the latest call always overwrites the
-        stored routing view.
+        with shape ``[num_tokens, num_layers, top_k]``.  Each response covers
+        ALL tokens in the sequence (not just new tokens), because SGLang does
+        not support ``routed_experts_start_len``. Therefore we overwrite rather
+        than accumulate — the latest call always has the complete routing.
+
+        **Design tradeoffs (overwrite vs accumulate)**:
+
+        Current approach is *overwrite*: each call replaces all stored routing.
+        For single-turn rollouts, this is trivially correct. For multi-turn,
+        SGLang re-computes routing for the full sequence each turn. Within a
+        single episode (no weight update between turns), the MoE router is
+        deterministic — same weights + same tokens = same routing — so
+        overwriting produces identical results to accumulating.
+
+        If model weights update between turns (async RL), the re-computed
+        prefix routing reflects the new weights rather than the weights that
+        originally generated those tokens. An *accumulate* approach (keep
+        prior turns' routing, append only new tokens' portion) would preserve
+        per-token routing-logprob correspondence. This can be done client-side
+        by slicing at ``len(existing_bytes)`` without SGLang changes.
+        Overwrite is simpler and sufficient for the common case; accumulate
+        is a future optimization for long multi-turn async rollouts.
 
         Args:
             data: Base64-encoded routed experts string from
@@ -168,7 +196,17 @@ class TokenManager:
 
     @property
     def routed_experts(self) -> bytes | None:
-        """Get routed experts as raw bytes."""
+        """Get routed experts as raw bytes.
+
+        Returns the decoded routing data from the most recent SGLang response,
+        which covers all ``seqlen - 1`` tokens in the trajectory. The bytes
+        contain flattened int32 expert IDs with logical shape
+        ``[total_tokens - 1, num_layers, top_k]``.
+
+        Returns:
+            Raw bytes of int32 expert IDs, or ``None`` if no routing data
+            has been recorded.
+        """
         return self._routed_experts_bytes
 
     @property
@@ -183,7 +221,11 @@ class TokenManager:
 
     @property
     def loss_mask(self) -> list[int]:
-        """Get loss mask for all tokens (1 = model output, 0 = prompt/tool)."""
+        """Get loss mask for all tokens (1 = model output, 0 = prompt/tool).
+
+        Notes:
+            Only compute loss on tokens where mask is 1 (model outputs).
+        """
         return [int(token.loss_mask) for token in self.tokens]
 
     @property
@@ -193,7 +235,12 @@ class TokenManager:
 
     @property
     def initial_prompt(self) -> list[Token]:
-        """Get the initial prompt tokens (``segments[0]``)."""
+        """Get the initial prompt tokens (`segments[0]`).
+
+        Notes:
+            Contains the full input context from the first generation call:
+            system prompt + tool definitions + user message (or conversation history).
+        """
         return self._segments[0] if self._segments else []
 
     @property
@@ -203,7 +250,7 @@ class TokenManager:
 
     @property
     def segment_info(self) -> list[tuple[bool, int]]:
-        """Get segment metadata as ``(is_output, length)`` tuples."""
+        """Get segment metadata as `(is_output, length)` tuples."""
         return [(seg[0].loss_mask if seg else False, len(seg)) for seg in self._segments]
 
     @property
