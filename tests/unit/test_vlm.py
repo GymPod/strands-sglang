@@ -44,6 +44,16 @@ def _image_block() -> dict:
     return {"image": {"format": "png", "source": {"bytes": _RED_PIXEL_PNG}}}
 
 
+def _image_block_from_bytes(image_bytes: bytes) -> dict:
+    """Strands ImageContent block with caller-provided bytes."""
+    return {"image": {"format": "png", "source": {"bytes": image_bytes}}}
+
+
+def _image_data_url(image_bytes: bytes) -> str:
+    """Build the expected data URL for an image block."""
+    return f"data:image/png;base64,{base64.b64encode(image_bytes).decode()}"
+
+
 @pytest.fixture
 def mock_tokenizer():
     """Mock tokenizer."""
@@ -200,7 +210,10 @@ class TestImageAccumulation:
         assert token_ids == [1, 2, 3]
         rendered_messages = mock_tokenizer.apply_chat_template.call_args.args[0]
         assert rendered_messages == [
-            {"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image", "image": _RED_PIXEL_DATA_URL}]}
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "describe"}, {"type": "image", "image": _RED_PIXEL_DATA_URL}],
+            }
         ]
 
     def test_prepare_prompt_messages_tracks_current_prompt_images(self, vlm_model, mock_tokenizer):
@@ -256,6 +269,151 @@ class TestImageAccumulation:
         prepared = vlm_model._prepare_prompt_messages(messages, system_prompt=None, tool_specs=None, is_multimodal=True)
 
         assert prepared.image_data == [_RED_PIXEL_DATA_URL]
+
+    @pytest.mark.asyncio
+    async def test_image_drop_reset_keeps_only_current_prompt_images(self, vlm_model, mock_tokenizer):
+        """Image-window resets should use only current images and start a fresh token trajectory."""
+        image_1 = b"img-1"
+        image_2 = b"img-2"
+        image_1_url = _image_data_url(image_1)
+        image_2_url = _image_data_url(image_2)
+
+        mock_tokenizer.encode.side_effect = [[11, 12], [21, 22]]
+        mock_tokenizer.apply_chat_template.side_effect = [
+            "<|vision_start|><|image_pad|><|vision_end|>turn-1",
+            "<|vision_start|><|image_pad|><|vision_end|>turn-2",
+        ]
+        vlm_model.client.generate = AsyncMock(
+            side_effect=[
+                {
+                    "text": "first",
+                    "output_ids": [13],
+                    "meta_info": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop"},
+                        "e2e_latency": 0.1,
+                        "input_token_logprobs": [[-0.1], [-0.2]],
+                        "output_token_logprobs": [[-0.3]],
+                    },
+                },
+                {
+                    "text": "second",
+                    "output_ids": [23],
+                    "meta_info": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop"},
+                        "e2e_latency": 0.1,
+                        "input_token_logprobs": [[-0.4], [-0.5]],
+                        "output_token_logprobs": [[-0.6]],
+                    },
+                },
+            ]
+        )
+
+        messages_turn_1 = [{"role": "user", "content": [{"text": "old image"}, _image_block_from_bytes(image_1)]}]
+        messages_turn_2 = [{"role": "user", "content": [{"text": "new image only"}, _image_block_from_bytes(image_2)]}]
+
+        async for _ in vlm_model.stream(messages_turn_1):
+            pass
+        async for _ in vlm_model.stream(messages_turn_2):
+            pass
+
+        first_call = vlm_model.client.generate.call_args_list[0].kwargs
+        second_call = vlm_model.client.generate.call_args_list[1].kwargs
+
+        assert first_call["image_data"] == [image_1_url]
+        assert second_call["image_data"] == [image_2_url]
+        assert vlm_model.token_manager.turn_trajectory_ids == [0, 1]
+        assert [trajectory.token_ids for trajectory in vlm_model.token_manager.trajectories] == [
+            [11, 12, 13],
+            [21, 22, 23],
+        ]
+        assert [trajectory.loss_mask for trajectory in vlm_model.token_manager.trajectories] == [
+            [0, 0, 1],
+            [0, 0, 1],
+        ]
+        assert [trajectory.token_offset for trajectory in vlm_model.token_manager.trajectories] == [0, 3]
+        assert [
+            token_id for trajectory in vlm_model.token_manager.trajectories for token_id in trajectory.token_ids
+        ] == [
+            11,
+            12,
+            13,
+            21,
+            22,
+            23,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_image_rewrite_with_same_prompt_tokens_starts_new_trajectory(self, vlm_model, mock_tokenizer):
+        """Changing retained image content should reset even if chat-template token IDs stay prefix-compatible."""
+        image_1 = b"img-1"
+        image_2 = b"img-2"
+        image_1_url = _image_data_url(image_1)
+        image_2_url = _image_data_url(image_2)
+
+        mock_tokenizer.encode.side_effect = [[11, 12], [11, 12, 13, 14]]
+        mock_tokenizer.apply_chat_template.side_effect = [
+            "<|vision_start|><|image_pad|><|vision_end|>turn-1",
+            "<|vision_start|><|image_pad|><|vision_end|>turn-1 plus follow-up",
+        ]
+        vlm_model.client.generate = AsyncMock(
+            side_effect=[
+                {
+                    "text": "first",
+                    "output_ids": [13],
+                    "meta_info": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop"},
+                        "e2e_latency": 0.1,
+                        "input_token_logprobs": [[-0.1], [-0.2]],
+                        "output_token_logprobs": [[-0.3]],
+                    },
+                },
+                {
+                    "text": "second",
+                    "output_ids": [15],
+                    "meta_info": {
+                        "prompt_tokens": 4,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop"},
+                        "e2e_latency": 0.1,
+                        "input_token_logprobs": [[-0.4], [-0.5], [-0.6], [-0.7]],
+                        "output_token_logprobs": [[-0.8]],
+                    },
+                },
+            ]
+        )
+
+        messages_turn_1 = [{"role": "user", "content": [{"text": "image one"}, _image_block_from_bytes(image_1)]}]
+        messages_turn_2 = [
+            {"role": "user", "content": [{"text": "image two now"}, _image_block_from_bytes(image_2)]},
+            {"role": "assistant", "content": [{"text": "first"}]},
+            {"role": "user", "content": [{"text": "follow up"}]},
+        ]
+
+        async for _ in vlm_model.stream(messages_turn_1):
+            pass
+        async for _ in vlm_model.stream(messages_turn_2):
+            pass
+
+        first_call = vlm_model.client.generate.call_args_list[0].kwargs
+        second_call = vlm_model.client.generate.call_args_list[1].kwargs
+
+        assert first_call["image_data"] == [image_1_url]
+        assert second_call["image_data"] == [image_2_url]
+        assert vlm_model.token_manager.turn_trajectory_ids == [0, 1]
+        assert [trajectory.token_ids for trajectory in vlm_model.token_manager.trajectories] == [
+            [11, 12, 13],
+            [11, 12, 13, 14, 15],
+        ]
 
 
 # ---------------------------------------------------------------------------

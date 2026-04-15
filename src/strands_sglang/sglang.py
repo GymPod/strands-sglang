@@ -112,6 +112,7 @@ class SGLangModel(Model):
         # State tracking (this makes SGLangModel stateful)
         self.token_manager = TokenManager()
         self._active_input_ids: list[int] = []
+        self._active_image_data: list[str] = []
         self.message_count: int = 0
         self.tool_parse_errors: dict[str, int] = {}  # per-tool parse error count
         self.image_data: list[str] = []  # current prompt image data URLs (VLM only)
@@ -122,6 +123,7 @@ class SGLangModel(Model):
         """Reset all state for a new episode."""
         self.token_manager.reset()
         self._active_input_ids = []
+        self._active_image_data = []
         self.message_count = 0
         self.tool_parse_errors = {}
         self.image_data = []
@@ -350,12 +352,15 @@ class SGLangModel(Model):
                 extends_active_context=True,
             )
 
-        if full_input_ids == self._active_input_ids:
+        if full_input_ids == self._active_input_ids and image_data == self._active_image_data:
             raise RuntimeError(
                 f"No new messages to tokenize (active_input_len={active_prefix_len}, got {len(messages)} messages)"
             )
 
-        extends_active_context = full_input_ids[:active_prefix_len] == self._active_input_ids
+        extends_active_context = (
+            full_input_ids[:active_prefix_len] == self._active_input_ids
+            and image_data[: len(self._active_image_data)] == self._active_image_data
+        )
         if extends_active_context:
             new_input_ids = full_input_ids[active_prefix_len:]
         else:
@@ -453,7 +458,9 @@ class SGLangModel(Model):
                 logprob_start_len=(
                     max(0, len(self._active_input_ids) - 1)
                     if return_logprob and prepared_prompt.extends_active_context and self._active_input_ids
-                    else 0 if return_logprob else None
+                    else 0
+                    if return_logprob
+                    else None
                 ),
                 image_data=self.image_data or None,
                 return_routed_experts=return_routed_experts,
@@ -490,6 +497,7 @@ class SGLangModel(Model):
             logprobs=[e[0] for e in output_token_logprobs] if output_token_logprobs else None,
         )
         self._active_input_ids = input_ids + output_ids
+        self._active_image_data = list(prepared_prompt.image_data)
         self.message_count = len(messages) + 1
 
         # Store routed experts for routing replay (overwrite semantics —

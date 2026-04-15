@@ -341,6 +341,204 @@ class TestStreamDefaults:
         assert model.token_manager.turn_trajectory_ids == [0, 1]
         assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [[11, 12, 13], [41, 42, 91]]
 
+    async def test_summary_style_resets_preserve_exact_token_partition(self, mock_tokenizer):
+        """Summary-like rewrites should partition the global token stream without loss or duplication."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="first", output_ids=[13], num_input_tokens=2),
+                _make_generate_response(text="summary", output_ids=[23], num_input_tokens=2),
+                _make_generate_response(text="post-summary", output_ids=[33], num_input_tokens=2),
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [[11, 12], [21, 22], [31, 32]]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "original"}]}]):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "Please summarize this conversation."}]}]):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "continue from summary"}]}]):
+            pass
+
+        assert model.token_manager.turn_trajectory_ids == [0, 1, 2]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [
+            [11, 12, 13],
+            [21, 22, 23],
+            [31, 32, 33],
+        ]
+        assert [trajectory.loss_mask for trajectory in model.token_manager.trajectories] == [
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+        ]
+        _assert_trajectory_partition(model)
+
+    async def test_dropping_old_thinking_blocks_preserves_partition(self, mock_tokenizer):
+        """Pruning old assistant reasoning should split once and keep additive turns merged on each side."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="reason-1", output_ids=[103], num_input_tokens=2),
+                _make_generate_response(text="answer-2", output_ids=[105], num_input_tokens=1),
+                _make_generate_response(text="answer-3", output_ids=[203], num_input_tokens=2),
+                _make_generate_response(text="answer-4", output_ids=[205], num_input_tokens=1),
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [
+            [101, 102],
+            [101, 102, 103, 104],
+            [201, 202],
+            [201, 202, 203, 204],
+        ]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "solve step one"}]}]):
+            pass
+        async for _ in model.stream(
+            [
+                {"role": "user", "content": [{"text": "solve step one"}]},
+                {"role": "assistant", "content": [{"text": "<think>older reasoning</think> answer"}]},
+                {"role": "user", "content": [{"text": "continue to step two"}]},
+            ]
+        ):
+            pass
+        async for _ in model.stream(
+            [
+                {"role": "user", "content": [{"text": "compressed context without old thinking"}]},
+            ]
+        ):
+            pass
+        async for _ in model.stream(
+            [
+                {"role": "user", "content": [{"text": "compressed context without old thinking"}]},
+                {"role": "assistant", "content": [{"text": "answer after pruning"}]},
+                {"role": "user", "content": [{"text": "continue after pruning"}]},
+            ]
+        ):
+            pass
+
+        assert model.token_manager.turn_trajectory_ids == [0, 0, 1, 1]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [
+            [101, 102, 103, 104, 105],
+            [201, 202, 203, 204, 205],
+        ]
+        assert [trajectory.loss_mask for trajectory in model.token_manager.trajectories] == [
+            [0, 0, 1, 0, 1],
+            [0, 0, 1, 0, 1],
+        ]
+        _assert_trajectory_partition(model)
+
+    async def test_repeated_cot_turn_drops_preserve_partition(self, mock_tokenizer):
+        """Repeated whole-turn CoT dropping should create repeated exact trajectory boundaries."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="cot-1", output_ids=[13], num_input_tokens=2),
+                _make_generate_response(text="cot-2", output_ids=[15], num_input_tokens=1),
+                _make_generate_response(text="cot-3", output_ids=[23], num_input_tokens=2),
+                _make_generate_response(text="cot-4", output_ids=[25], num_input_tokens=1),
+                _make_generate_response(text="cot-5", output_ids=[33], num_input_tokens=2),
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [
+            [11, 12],
+            [11, 12, 13, 14],
+            [21, 22],
+            [21, 22, 23, 24],
+            [31, 32],
+        ]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "step one"}]}]):
+            pass
+        async for _ in model.stream(
+            [
+                {"role": "user", "content": [{"text": "step one"}]},
+                {"role": "assistant", "content": [{"text": "<think>cot one</think> reply"}]},
+                {"role": "user", "content": [{"text": "step two"}]},
+            ]
+        ):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "drop old cot turn"}]}]):
+            pass
+        async for _ in model.stream(
+            [
+                {"role": "user", "content": [{"text": "drop old cot turn"}]},
+                {"role": "assistant", "content": [{"text": "reply after first drop"}]},
+                {"role": "user", "content": [{"text": "step four"}]},
+            ]
+        ):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "drop another old cot turn"}]}]):
+            pass
+
+        assert model.token_manager.turn_trajectory_ids == [0, 0, 1, 1, 2]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [
+            [11, 12, 13, 14, 15],
+            [21, 22, 23, 24, 25],
+            [31, 32, 33],
+        ]
+        assert [trajectory.loss_mask for trajectory in model.token_manager.trajectories] == [
+            [0, 0, 1, 0, 1],
+            [0, 0, 1, 0, 1],
+            [0, 0, 1],
+        ]
+        _assert_trajectory_partition(model)
+
+    async def test_strict_prefix_compression_starts_new_trajectory(self, mock_tokenizer):
+        """Compressing to a strict prefix of prior context should still count as a fresh trajectory."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="first", output_ids=[13], num_input_tokens=2),
+                _make_generate_response(text="second", output_ids=[15], num_input_tokens=1),
+                _make_generate_response(text="compressed", output_ids=[17], num_input_tokens=1),
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [
+            [11, 12],
+            [11, 12, 13, 14],
+            [11],
+        ]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "turn one"}]}]):
+            pass
+        async for _ in model.stream(
+            [
+                {"role": "user", "content": [{"text": "turn one"}]},
+                {"role": "assistant", "content": [{"text": "assistant one"}]},
+                {"role": "user", "content": [{"text": "turn two"}]},
+            ]
+        ):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "kept prefix only"}]}]):
+            pass
+
+        assert model.token_manager.turn_trajectory_ids == [0, 0, 1]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [
+            [11, 12, 13, 14, 15],
+            [11, 17],
+        ]
+        assert [trajectory.loss_mask for trajectory in model.token_manager.trajectories] == [
+            [0, 0, 1, 0, 1],
+            [0, 1],
+        ]
+        _assert_trajectory_partition(model)
+
 
 # ---------------------------------------------------------------------------
 # Helpers for routing replay end-to-end tests
@@ -406,6 +604,25 @@ def _make_generate_response(
 async def _collect_stream(stream):
     """Collect all events from an async iterable."""
     return [event async for event in stream]
+
+
+def _assert_trajectory_partition(model: SGLangModel) -> None:
+    """Assert grouped trajectories exactly partition the flat token stream."""
+    trajectories = model.token_manager.trajectories
+    assert trajectories
+
+    flat_token_ids = model.token_manager.token_ids
+    flat_logprobs = model.token_manager.logprobs
+    flat_loss_mask = model.token_manager.loss_mask
+
+    assert [token_id for trajectory in trajectories for token_id in trajectory.token_ids] == flat_token_ids
+    assert [logprob for trajectory in trajectories for logprob in trajectory.logprobs] == flat_logprobs
+    assert [mask for trajectory in trajectories for mask in trajectory.loss_mask] == flat_loss_mask
+
+    expected_offset = 0
+    for trajectory in trajectories:
+        assert trajectory.token_offset == expected_offset
+        expected_offset += len(trajectory.token_ids)
 
 
 class TestRoutedExpertsE2E:
@@ -477,7 +694,11 @@ class TestRoutedExpertsE2E:
 
         with patch.object(model.client, "generate", new_callable=AsyncMock, return_value=response_t1):
             messages_t1 = [{"role": "user", "content": [{"text": "What is 1+1?"}]}]
-            await _collect_stream(model.stream(messages_t1, tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}]))
+            await _collect_stream(
+                model.stream(
+                    messages_t1, tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}]
+                )
+            )
 
         assert model.token_manager.token_ids == prompt_tokens_t1 + output_ids_t1
         total_after_t1 = len(model.token_manager)  # 5
@@ -513,7 +734,11 @@ class TestRoutedExpertsE2E:
                     ],
                 },
             ]
-            await _collect_stream(model.stream(messages_t2, tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}]))
+            await _collect_stream(
+                model.stream(
+                    messages_t2, tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}]
+                )
+            )
 
             # Verify return_routed_experts is passed to generate
             call_kwargs = mock_gen.call_args.kwargs
