@@ -55,6 +55,7 @@ T = TypeVar("T", bound=BaseModel)
 class _PreparedPrompt:
     """Prompt prepared for one `/generate` call."""
 
+    input_ids: list[int]
     full_input_ids: list[int]
     new_input_ids: list[int]
     image_data: list[str]
@@ -339,13 +340,21 @@ class SGLangModel(Model):
         tool_specs: list[ToolSpec] | None,
         is_multimodal: bool,
     ) -> _PreparedPrompt:
-        """Prepare the current full prompt and its incremental training segment."""
+        """Prepare the current prompt and incremental training segment.
+
+        For additive turns, keep the exact previously generated token stream and
+        only tokenize the newly introduced messages. Assistant outputs and tool
+        calls are not guaranteed to round-trip through the chat template byte
+        for byte, so rebuilding the entire prompt on every turn can shift the
+        live model context even when conversation history was not rewritten.
+        """
         prompt, image_data = self._render_prompt_messages(messages, system_prompt, tool_specs, is_multimodal)
         full_input_ids = list(self.tokenizer.encode(prompt, add_special_tokens=False))
         active_prefix_len = len(self._active_input_ids)
 
         if active_prefix_len == 0:
             return _PreparedPrompt(
+                input_ids=full_input_ids,
                 full_input_ids=full_input_ids,
                 new_input_ids=full_input_ids,
                 image_data=image_data,
@@ -355,6 +364,48 @@ class SGLangModel(Model):
         if full_input_ids == self._active_input_ids and image_data == self._active_image_data:
             raise RuntimeError(
                 f"No new messages to tokenize (active_input_len={active_prefix_len}, got {len(messages)} messages)"
+            )
+
+        multimodal = is_multimodal or self._messages_have_images(messages)
+        additive_messages = len(messages) > self.message_count
+        preserves_image_prefix = image_data[: len(self._active_image_data)] == self._active_image_data
+        if additive_messages and preserves_image_prefix:
+            new_hf_messages = self.format_messages(
+                self.sort_tool_results(messages[self.message_count :]),
+                is_multimodal=multimodal,
+            )
+            fake_messages: Messages = [
+                {"role": "system", "content": [{"text": "FAKE SYSTEM PROMPT"}]},
+                {"role": "user", "content": [{"text": "FAKE USER MESSAGE"}]},
+            ]
+            fake_hf_messages = self.format_messages(fake_messages, is_multimodal=multimodal)
+            delta_prompt_with_prefix = cast(
+                str,
+                self.tokenizer.apply_chat_template(
+                    fake_hf_messages + new_hf_messages,
+                    add_generation_prompt=True,
+                    **self._chat_template_kwargs,
+                ),
+            )
+            fake_prefix_prompt = cast(
+                str,
+                self.tokenizer.apply_chat_template(
+                    fake_hf_messages,
+                    add_generation_prompt=False,
+                    **self._chat_template_kwargs,
+                ),
+            )
+            if not delta_prompt_with_prefix.startswith(fake_prefix_prompt):
+                raise AssertionError("incremental prompt must start with the fake prefix prompt")
+            delta_prompt = self.message_separator + delta_prompt_with_prefix[len(fake_prefix_prompt) :]
+            new_input_ids = list(self.tokenizer.encode(delta_prompt, add_special_tokens=False))
+            input_ids = self._active_input_ids + new_input_ids
+            return _PreparedPrompt(
+                input_ids=input_ids,
+                full_input_ids=full_input_ids,
+                new_input_ids=new_input_ids,
+                image_data=image_data,
+                extends_active_context=True,
             )
 
         extends_active_context = (
@@ -367,6 +418,7 @@ class SGLangModel(Model):
             new_input_ids = full_input_ids
 
         return _PreparedPrompt(
+            input_ids=full_input_ids,
             full_input_ids=full_input_ids,
             new_input_ids=new_input_ids,
             image_data=image_data,
@@ -423,7 +475,7 @@ class SGLangModel(Model):
             tool_specs=tool_specs,
             is_multimodal=await self.client.is_multimodal(),
         )
-        input_ids = prepared_prompt.full_input_ids
+        input_ids = prepared_prompt.input_ids
         self.image_data = prepared_prompt.image_data
 
         # Assistant message start
@@ -478,7 +530,7 @@ class SGLangModel(Model):
             token_ids=output_ids,
             logprobs=[e[0] for e in output_token_logprobs] if output_token_logprobs else None,
         )
-        self._active_input_ids = input_ids + output_ids
+        self._active_input_ids = prepared_prompt.input_ids + output_ids
         self._active_image_data = list(prepared_prompt.image_data)
         self.message_count = len(messages) + 1
 
@@ -571,7 +623,7 @@ class SGLangModel(Model):
         # Call SGLang /generate endpoint
         try:
             response = await self.client.generate(
-                input_ids=prepared_prompt.full_input_ids,
+                input_ids=prepared_prompt.input_ids,
                 sampling_params=sampling_params,
                 return_logprob=False,  # No need for logprobs in structured output
                 image_data=prepared_prompt.image_data or None,

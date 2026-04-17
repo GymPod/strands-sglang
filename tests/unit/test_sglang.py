@@ -154,10 +154,14 @@ class TestTokenizePromptMessages:
     def test_additive_prompt_returns_incremental_suffix(self, model, mock_tokenizer):
         """Continuation prompts only return the suffix beyond the active context."""
         model._active_input_ids = [10, 11]
+        model.message_count = 2
         mock_tokenizer.encode.return_value = [10, 11, 12, 13]
 
         token_ids = model.tokenize_prompt_messages(
-            [{"role": "user", "content": [{"text": "Continue"}]}],
+            [
+                {"role": "user", "content": [{"text": "Hello"}]},
+                {"role": "assistant", "content": [{"text": "Continue"}]},
+            ],
             system_prompt=None,
         )
 
@@ -283,6 +287,7 @@ class TestStreamDefaults:
         mock_tokenizer.encode.return_value = [41, 42]
         model = SGLangModel(client=client, tokenizer=mock_tokenizer)
         model._active_input_ids = [10, 11, 12]
+        model.message_count = 1
 
         messages = [{"role": "user", "content": [{"text": "compressed summary"}]}]
         async for _ in model.stream(messages):
@@ -293,6 +298,48 @@ class TestStreamDefaults:
         assert call_kwargs.kwargs["logprob_start_len"] == 0
         assert model.token_manager.turn_trajectory_ids == [0]
         assert len(model.token_manager.trajectories) == 1
+
+    async def test_stream_additive_turn_keeps_exact_prior_token_stream(self, mock_tokenizer):
+        """Additive turns must reuse raw previously generated tokens, not reserialized history."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="first", output_ids=[13], num_input_tokens=2),
+                _make_generate_response(text="second", output_ids=[23], num_input_tokens=5),
+            ]
+        )
+        mock_tokenizer.apply_chat_template.side_effect = [
+            "turn-1 prompt",
+            "retokenized full prompt for turn 2",
+            "FAKE PREFIXfollow-up",
+            "FAKE PREFIX",
+        ]
+        mock_tokenizer.encode.side_effect = [
+            [11, 12],
+            [81, 82, 83, 84],
+            [21, 22],
+        ]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "turn 1"}]}]):
+            pass
+        async for _ in model.stream(
+            [
+                {"role": "user", "content": [{"text": "turn 1"}]},
+                {"role": "assistant", "content": [{"text": "assistant reformatted"}]},
+                {"role": "user", "content": [{"text": "follow-up"}]},
+            ]
+        ):
+            pass
+
+        second_call_kwargs = client.generate.call_args_list[1].kwargs
+        assert second_call_kwargs["input_ids"] == [11, 12, 13, 21, 22]
+        assert second_call_kwargs["logprob_start_len"] == 2
+        assert model.token_manager.turn_trajectory_ids == [0, 0]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [[11, 12, 13, 21, 22, 23]]
 
     async def test_stream_marks_new_trajectory_after_context_reset(self, mock_tokenizer):
         """A non-prefix prompt reset should start a new grouped trajectory."""
