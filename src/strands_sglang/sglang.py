@@ -164,6 +164,31 @@ class SGLangModel(Model):
         sep = self.tokenizer.encode(probe.split("__M__", 1)[1], add_special_tokens=False)[1:]
         return self.tokenizer.decode(sep) if sep else ""
 
+    @cached_property
+    def assistant_stop_token_ids(self) -> list[int]:
+        """Auto-detect the assistant stop token(s) emitted before the next message bridge."""
+        probe = str(
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": "U"}, {"role": "assistant", "content": "__M__"}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        )
+        if "__M__" not in probe:
+            return []
+        suffix = probe.split("__M__", 1)[1]
+        stop_text = suffix[: -len(self.message_separator)] if self.message_separator else suffix
+        return list(self.tokenizer.encode(stop_text, add_special_tokens=False))
+
+    def _append_missing_assistant_stop(self, token_ids: list[int]) -> list[int]:
+        """Append assistant stop token(s) when the server omits them from output_ids."""
+        stop_ids = self.assistant_stop_token_ids
+        if not stop_ids:
+            return token_ids
+        if len(token_ids) >= len(stop_ids) and token_ids[-len(stop_ids) :] == stop_ids:
+            return token_ids
+        return token_ids + stop_ids
+
     @classmethod
     def format_content_block(
         cls, content_block: ContentBlock | ToolResultContent, is_multimodal: bool = False
@@ -530,7 +555,10 @@ class SGLangModel(Model):
             token_ids=output_ids,
             logprobs=[e[0] for e in output_token_logprobs] if output_token_logprobs else None,
         )
-        self._active_input_ids = prepared_prompt.input_ids + output_ids
+        active_input_ids = prepared_prompt.input_ids + output_ids
+        if meta_info["finish_reason"]["type"] != "length":
+            active_input_ids = self._append_missing_assistant_stop(active_input_ids)
+        self._active_input_ids = active_input_ids
         self._active_image_data = list(prepared_prompt.image_data)
         self.message_count = len(messages) + 1
 

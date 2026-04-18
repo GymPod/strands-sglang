@@ -42,6 +42,7 @@ def model(mock_tokenizer):
     client._is_multimodal = False
     model = SGLangModel(client=client, tokenizer=mock_tokenizer)
     model.__dict__["message_separator"] = ""  # override cached_property (mock has no real template)
+    model.__dict__["assistant_stop_token_ids"] = []
     return model
 
 
@@ -323,6 +324,7 @@ class TestStreamDefaults:
 
         model = SGLangModel(client=client, tokenizer=mock_tokenizer)
         model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = []
 
         async for _ in model.stream([{"role": "user", "content": [{"text": "turn 1"}]}]):
             pass
@@ -338,6 +340,70 @@ class TestStreamDefaults:
         second_call_kwargs = client.generate.call_args_list[1].kwargs
         assert second_call_kwargs["input_ids"] == [11, 12, 13, 21, 22]
         assert second_call_kwargs["logprob_start_len"] == 2
+        assert model.token_manager.turn_trajectory_ids == [0, 0]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [[11, 12, 13, 21, 22, 23]]
+
+    async def test_stream_tool_result_turn_inserts_missing_assistant_stop_token(self, mock_tokenizer):
+        """Tool-result continuations must restore the assistant stop token if SGLang omits it."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(
+                    text='<tool_call>{"name": "calc", "arguments": {"expr": "1+1"}}</tool_call>',
+                    output_ids=[13],
+                    num_input_tokens=2,
+                ),
+                _make_generate_response(text="The answer is 2.", output_ids=[23], num_input_tokens=6),
+            ]
+        )
+        mock_tokenizer.apply_chat_template.side_effect = [
+            "turn-1 prompt",
+            "retokenized full prompt for turn 2",
+            "FAKE PREFIXfollow-up tool result",
+            "FAKE PREFIX",
+        ]
+        mock_tokenizer.encode.side_effect = [
+            [11, 12],
+            [11, 12, 13, 99, 21, 22],
+            [21, 22],
+        ]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = [99]
+
+        turn_1_messages = [{"role": "user", "content": [{"text": "What is 1+1?"}]}]
+        async for _ in model.stream(
+            turn_1_messages,
+            tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}],
+        ):
+            pass
+
+        assert model._active_input_ids == [11, 12, 13, 99]
+
+        turn_2_messages = turn_1_messages + [
+            {
+                "role": "assistant",
+                "content": [
+                    {"text": '<tool_call>{"name": "calc", "arguments": {"expr": "1+1"}}</tool_call>'},
+                    {"toolUse": {"toolUseId": "call_0000", "name": "calc", "input": {"expr": "1+1"}}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"toolResult": {"toolUseId": "call_0000", "content": [{"text": "2"}]}}],
+            },
+        ]
+        async for _ in model.stream(
+            turn_2_messages,
+            tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}],
+        ):
+            pass
+
+        second_call_kwargs = client.generate.call_args_list[1].kwargs
+        assert second_call_kwargs["input_ids"] == [11, 12, 13, 99, 21, 22]
+        assert second_call_kwargs["logprob_start_len"] == 3
         assert model.token_manager.turn_trajectory_ids == [0, 0]
         assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [[11, 12, 13, 21, 22, 23]]
 
@@ -379,6 +445,7 @@ class TestStreamDefaults:
 
         model = SGLangModel(client=client, tokenizer=mock_tokenizer)
         model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = []
 
         async for _ in model.stream([{"role": "user", "content": [{"text": "first"}]}]):
             pass
@@ -403,6 +470,7 @@ class TestStreamDefaults:
 
         model = SGLangModel(client=client, tokenizer=mock_tokenizer)
         model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = []
 
         async for _ in model.stream([{"role": "user", "content": [{"text": "original"}]}]):
             pass
@@ -526,6 +594,7 @@ class TestRoutedExpertsE2E:
         client._is_multimodal = False
         m = SGLangModel(client=client, tokenizer=mock_tokenizer, return_routed_experts=True)
         m.__dict__["message_separator"] = ""
+        m.__dict__["assistant_stop_token_ids"] = []
         return m
 
     async def test_single_turn_routing(self, model):
@@ -677,6 +746,7 @@ class TestRoutedExpertsE2E:
         client._is_multimodal = False
         model = SGLangModel(client=client, tokenizer=mock_tokenizer)
         model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = []
 
         mock_tokenizer.encode.return_value = [10, 20]
         response = _make_generate_response(

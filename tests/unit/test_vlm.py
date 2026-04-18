@@ -75,6 +75,7 @@ def vlm_model(client, mock_tokenizer):
     client._is_multimodal = True
     model = SGLangModel(client=client, tokenizer=mock_tokenizer)
     model.__dict__["message_separator"] = ""  # override cached_property (mock has no real template)
+    model.__dict__["assistant_stop_token_ids"] = []
     return model
 
 
@@ -84,6 +85,7 @@ def text_model(client, mock_tokenizer):
     client._is_multimodal = False
     model = SGLangModel(client=client, tokenizer=mock_tokenizer)
     model.__dict__["message_separator"] = ""  # override cached_property (mock has no real template)
+    model.__dict__["assistant_stop_token_ids"] = []
     return model
 
 
