@@ -562,9 +562,7 @@ class SGLangModel(Model):
         self._active_image_data = list(prepared_prompt.image_data)
         self.message_count = len(messages) + 1
 
-        # Store routed experts for routing replay (overwrite semantics —
-        # SGLang returns routing for all active-trajectory transitions each
-        # turn, not just the newly generated suffix)
+        # Store routed experts for routing replay.
         if return_routed_experts:
             routed_experts_data = meta_info.get("routed_experts")
             if routed_experts_data:
