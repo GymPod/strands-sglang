@@ -720,6 +720,13 @@ class TestRoutedExpertsE2E:
             chunk = decoded[pos * EXPERTS_PER_TOKEN : (pos + 1) * EXPERTS_PER_TOKEN]
             assert chunk == [pos * 10 + k for k in range(EXPERTS_PER_TOKEN)]
 
+        trajectories = model.token_manager.trajectories
+        assert len(trajectories) == 1
+        assert trajectories[0].trajectory_id == 0
+        assert trajectories[0].token_offset == 0
+        assert trajectories[0].token_ids == expected_ids
+        assert trajectories[0].routed_experts == routing
+
     async def test_routing_aligns_with_loss_mask(self, model, mock_tokenizer):
         """Routing entries align 1:1 with token transitions."""
         prompt_tokens = [10, 20, 30]
