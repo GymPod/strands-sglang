@@ -563,7 +563,8 @@ class SGLangModel(Model):
         self.message_count = len(messages) + 1
 
         # Store routed experts for routing replay (overwrite semantics —
-        # SGLang returns routing for ALL tokens each turn, not incremental)
+        # SGLang returns routing for all active-trajectory transitions each
+        # turn, not just the newly generated suffix)
         if return_routed_experts:
             routed_experts_data = meta_info.get("routed_experts")
             if routed_experts_data:

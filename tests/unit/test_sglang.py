@@ -522,7 +522,7 @@ def _make_generate_response(
 ) -> dict:
     """Build a mock SGLang /generate response.
 
-    When include_routing is True, generates deterministic per-token routing:
+    When include_routing is True, generates deterministic per-transition routing:
     token at position i gets experts [i*10, i*10+1, i*10+2, i*10+3]
     (for NUM_LAYERS=2, TOP_K=2).
     """
@@ -538,9 +538,9 @@ def _make_generate_response(
     }
 
     if include_routing:
-        # Generate routing for tokens from routing_start to total-1
+        # Generate routing for transitions from routing_start to total-2.
         expert_ids = []
-        for pos in range(routing_start, total):
+        for pos in range(routing_start, max(total - 1, routing_start)):
             expert_ids.extend([pos * 10 + k for k in range(EXPERTS_PER_TOKEN)])
         meta_info["routed_experts"] = _make_routing_b64(expert_ids)
 
@@ -575,6 +575,9 @@ def _assert_trajectory_partition(model: SGLangModel) -> None:
     expected_offset = 0
     for trajectory in trajectories:
         assert trajectory.token_offset == expected_offset
+        if trajectory.routed_experts is not None:
+            routing_entries = len(_decode_routing(trajectory.routed_experts)) // EXPERTS_PER_TOKEN
+            assert routing_entries == max(len(trajectory.token_ids) - 1, 0)
         expected_offset += len(trajectory.token_ids)
 
 
@@ -598,7 +601,7 @@ class TestRoutedExpertsE2E:
         return m
 
     async def test_single_turn_routing(self, model):
-        """Single turn: routing covers prompt + response tokens."""
+        """Single turn: routing covers local trajectory transitions."""
         prompt_tokens = [10, 20, 30]
         output_ids = [40, 50]
 
@@ -620,18 +623,20 @@ class TestRoutedExpertsE2E:
         routing = model.token_manager.routed_experts
         assert routing is not None
         decoded = _decode_routing(routing)
-        assert len(decoded) == 5 * EXPERTS_PER_TOKEN
+        assert len(decoded) == 4 * EXPERTS_PER_TOKEN
 
-        for pos in range(5):
+        for pos in range(4):
             chunk = decoded[pos * EXPERTS_PER_TOKEN : (pos + 1) * EXPERTS_PER_TOKEN]
             assert chunk == [pos * 10 + k for k in range(EXPERTS_PER_TOKEN)]
+        assert model.token_manager.trajectories[0].routed_experts == routing
 
     async def test_multi_turn_with_tool_call(self, model, mock_tokenizer):
-        """Multi-turn with overwrite semantics: turn 2 returns routing for ALL tokens.
+        """Multi-turn with overwrite semantics within the active trajectory.
 
         SGLang does not support routed_experts_start_len, so each response
-        includes routing for every token in the sequence. The latest response
-        overwrites (not accumulates) the previous routing data.
+        includes routing for every local transition in the active trajectory.
+        The latest response overwrites (not accumulates) the previous routing
+        data for that trajectory.
         """
         # --- Turn 1: user prompt -> model generates tool call ---
         prompt_tokens_t1 = [10, 20, 30]
@@ -658,7 +663,7 @@ class TestRoutedExpertsE2E:
         total_after_t1 = len(model.token_manager)  # 5
 
         # --- Turn 2: tool result -> model generates final answer ---
-        # SGLang returns routing for ALL tokens (routing_start=0), not just new ones
+        # SGLang returns routing for ALL active transitions (routing_start=0), not just new ones
         tool_result_tokens = [60, 70]
         output_ids_t2 = [80, 90, 100]
         mock_tokenizer.encode.return_value = tool_result_tokens
@@ -668,7 +673,7 @@ class TestRoutedExpertsE2E:
             text="The answer is 2.",
             output_ids=output_ids_t2,
             num_input_tokens=total_input_t2,
-            routing_start=0,  # SGLang returns routing for ALL tokens
+            routing_start=0,  # SGLang returns routing for all active transitions
             include_routing=True,
         )
 
@@ -704,19 +709,19 @@ class TestRoutedExpertsE2E:
         total_tokens = len(expected_ids)  # 10
 
         # Routing is from turn 2 only (overwrite, not accumulate).
-        # Turn 2 returned routing for ALL 10 tokens (routing_start=0).
+        # Turn 2 returned routing for ALL 9 transitions in the 10-token trajectory.
         routing = model.token_manager.routed_experts
         assert routing is not None
         decoded = _decode_routing(routing)
-        assert len(decoded) == total_tokens * EXPERTS_PER_TOKEN
+        assert len(decoded) == (total_tokens - 1) * EXPERTS_PER_TOKEN
 
         # Verify per-token expert IDs from turn 2's response
-        for pos in range(total_tokens):
+        for pos in range(total_tokens - 1):
             chunk = decoded[pos * EXPERTS_PER_TOKEN : (pos + 1) * EXPERTS_PER_TOKEN]
             assert chunk == [pos * 10 + k for k in range(EXPERTS_PER_TOKEN)]
 
     async def test_routing_aligns_with_loss_mask(self, model, mock_tokenizer):
-        """Routing entries align 1:1 with token_ids and loss_mask."""
+        """Routing entries align 1:1 with token transitions."""
         prompt_tokens = [10, 20, 30]
         output_ids = [40, 50]
         mock_tokenizer.encode.return_value = prompt_tokens
@@ -736,9 +741,37 @@ class TestRoutedExpertsE2E:
         n_tokens = len(model.token_manager.token_ids)
         routing_entries = len(_decode_routing(model.token_manager.routed_experts)) // EXPERTS_PER_TOKEN
 
-        assert routing_entries == n_tokens
+        assert routing_entries == n_tokens - 1
         assert len(model.token_manager.loss_mask) == n_tokens
         assert len(model.token_manager.logprobs) == n_tokens
+
+    async def test_context_reset_keeps_routing_local_to_each_trajectory(self, model, mock_tokenizer):
+        """Managed context resets must snapshot routing per split trajectory."""
+        model.client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="first", output_ids=[13], num_input_tokens=2, include_routing=True),
+                _make_generate_response(text="summary", output_ids=[23], num_input_tokens=2, include_routing=True),
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [[11, 12], [21, 22]]
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "first"}]}]):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "summary"}]}]):
+            pass
+
+        trajectories = model.token_manager.trajectories
+        assert len(trajectories) == 2
+        assert [trajectory.token_ids for trajectory in trajectories] == [[11, 12, 13], [21, 22, 23]]
+        assert [trajectory.token_offset for trajectory in trajectories] == [0, 3]
+
+        first_routing = trajectories[0].routed_experts
+        second_routing = trajectories[1].routed_experts
+        assert first_routing is not None
+        assert second_routing is not None
+        assert _decode_routing(first_routing) == [0, 1, 2, 3, 10, 11, 12, 13]
+        assert _decode_routing(second_routing) == [0, 1, 2, 3, 10, 11, 12, 13]
+        assert model.token_manager.routed_experts == second_routing
 
     async def test_routing_disabled_by_default(self, mock_tokenizer):
         """When return_routed_experts is not set, no routing data is recorded."""

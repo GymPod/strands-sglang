@@ -328,7 +328,7 @@ class TestRoutedExperts:
         assert list(decoded) == experts
 
     def test_multi_turn_overwrites(self):
-        """Second call overwrites first (SGLang returns routing for ALL tokens each turn)."""
+        """Second call overwrites first within the active trajectory."""
         manager = TokenManager()
 
         # Turn 1: prompt + response routing (3 tokens, 1 layer, top_k=2)
@@ -344,6 +344,27 @@ class TestRoutedExperts:
         assert result is not None
         decoded = struct.unpack(f"<{len(turn2_experts)}i", result)
         assert list(decoded) == turn2_experts
+
+    def test_split_trajectories_keep_distinct_routing_buffers(self) -> None:
+        """Context resets should keep per-trajectory routing data separate."""
+        manager = TokenManager()
+        first_experts = [10, 11, 12, 13]
+        second_experts = [20, 21]
+
+        manager.add_prompt([1, 2])
+        manager.add_response([3], logprobs=[-0.1])
+        manager.add_routed_experts(_make_routed_experts_b64(first_experts))
+
+        manager.start_new_trajectory()
+        manager.add_prompt([4, 5])
+        manager.add_response([6], logprobs=[-0.2])
+        manager.add_routed_experts(_make_routed_experts_b64(second_experts))
+
+        trajectories = manager.trajectories
+        assert len(trajectories) == 2
+        assert trajectories[0].routed_experts == struct.pack(f"<{len(first_experts)}i", *first_experts)
+        assert trajectories[1].routed_experts == struct.pack(f"<{len(second_experts)}i", *second_experts)
+        assert manager.routed_experts == struct.pack(f"<{len(second_experts)}i", *second_experts)
 
     def test_reset_then_reuse(self):
         """Routing data can be accumulated after reset."""
@@ -384,6 +405,7 @@ class TestTokenManagerTrajectories:
                 logprobs=[None, None, -0.1, None, -0.2],
                 loss_mask=[0, 0, 1, 0, 1],
                 segment_info=[(False, 2), (True, 1), (False, 1), (True, 1)],
+                routed_experts=None,
                 token_offset=0,
             ),
             TokenTrajectory(
@@ -392,6 +414,7 @@ class TestTokenManagerTrajectories:
                 logprobs=[None, None, -0.3],
                 loss_mask=[0, 0, 1],
                 segment_info=[(False, 2), (True, 1)],
+                routed_experts=None,
                 token_offset=5,
             ),
         ]

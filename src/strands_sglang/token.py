@@ -53,6 +53,8 @@ class TokenTrajectory:
         logprobs: Flattened per-token log probabilities (prompt tokens may be ``None``).
         loss_mask: Integer mask aligned to ``token_ids``.
         segment_info: Segment metadata as ``(is_output, length)`` tuples.
+        routed_experts: Raw bytes of MoE routing decisions for this trajectory
+            only, or ``None`` when routing replay is disabled.
         token_offset: Global starting token offset within the full rollout token stream.
     """
 
@@ -61,6 +63,7 @@ class TokenTrajectory:
     logprobs: list[float | None]
     loss_mask: list[int]
     segment_info: list[tuple[bool, int]]
+    routed_experts: bytes | None
     token_offset: int
 
 
@@ -95,6 +98,7 @@ class TokenManager:
         """Create a TokenManager."""
         self._segments: list[list[Token]] = []
         self._routed_experts_bytes: bytes | None = None
+        self._trajectory_routed_experts_bytes: list[bytes | None] = []
         self._trajectory_start_segment_indices: list[int] = []
         self._turn_trajectory_ids: list[int] = []
 
@@ -102,8 +106,14 @@ class TokenManager:
         """Reset token accumulation for a new episode."""
         self._segments = []
         self._routed_experts_bytes = None
+        self._trajectory_routed_experts_bytes = []
         self._trajectory_start_segment_indices = []
         self._turn_trajectory_ids = []
+
+    def _ensure_current_trajectory_slot(self) -> None:
+        """Ensure routed-expert storage exists for the current trajectory."""
+        while len(self._trajectory_routed_experts_bytes) <= self.current_trajectory_id:
+            self._trajectory_routed_experts_bytes.append(None)
 
     def start_new_trajectory(self) -> None:
         """Mark the next segment as the start of a new training trajectory.
@@ -163,12 +173,18 @@ class TokenManager:
     def add_routed_experts(self, data: str) -> None:
         """Store routed experts from an SGLang response.
 
-        Decodes the base64 wire format and stores raw bytes. SGLang returns
-        routed experts as a base64-encoded string of flattened int32 values
-        with shape ``[num_tokens, num_layers, top_k]``.  Each response covers
-        ALL tokens in the sequence (not just new tokens), because SGLang does
-        not support ``routed_experts_start_len``. Therefore we overwrite rather
-        than accumulate — the latest call always has the complete routing.
+        Decodes the base64 wire format and stores raw bytes for both:
+        - ``routed_experts``: the latest active trajectory, for backward
+          compatibility with additive callers
+        - ``TokenTrajectory.routed_experts``: the current logical trajectory
+
+        SGLang returns routed experts as a base64-encoded string of flattened
+        int32 values with logical shape ``[num_tokens - 1, num_layers, top_k]``.
+        Within one logical trajectory, each response covers ALL tokens in the
+        current active sequence (not just new ones), because SGLang does not
+        support ``routed_experts_start_len``. Therefore we overwrite rather
+        than accumulate — the latest call always has the complete routing for
+        the active trajectory.
 
         **Design tradeoffs (overwrite vs accumulate)**:
 
@@ -192,16 +208,19 @@ class TokenManager:
             data: Base64-encoded routed experts string from
                 ``meta_info["routed_experts"]``.
         """
-        self._routed_experts_bytes = base64.b64decode(data)
+        decoded = base64.b64decode(data)
+        self._routed_experts_bytes = decoded
+        self._ensure_current_trajectory_slot()
+        self._trajectory_routed_experts_bytes[self.current_trajectory_id] = decoded
 
     @property
     def routed_experts(self) -> bytes | None:
         """Get routed experts as raw bytes.
 
-        Returns the decoded routing data from the most recent SGLang response,
-        which covers all ``seqlen - 1`` tokens in the trajectory. The bytes
-        contain flattened int32 expert IDs with logical shape
-        ``[total_tokens - 1, num_layers, top_k]``.
+        Returns the decoded routing data from the most recent SGLang response.
+        Under additive conversations this is the full active trajectory. After
+        a managed-context rewrite it refers only to the latest trajectory; use
+        ``TokenTrajectory.routed_experts`` for exact per-trajectory routing.
 
         Returns:
             Raw bytes of int32 expert IDs, or ``None`` if no routing data
@@ -288,6 +307,11 @@ class TokenManager:
                     segment_info=[
                         (segment[0].loss_mask if segment else False, len(segment)) for segment in segment_slice
                     ],
+                    routed_experts=(
+                        self._trajectory_routed_experts_bytes[trajectory_id]
+                        if trajectory_id < len(self._trajectory_routed_experts_bytes)
+                        else None
+                    ),
                     token_offset=token_offset,
                 )
             )
