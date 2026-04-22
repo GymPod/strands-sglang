@@ -56,7 +56,6 @@ class _PreparedPrompt:
     """Prompt prepared for one `/generate` call."""
 
     input_ids: list[int]
-    full_input_ids: list[int]
     new_input_ids: list[int]
     image_data: list[str]
     extends_active_context: bool
@@ -335,29 +334,6 @@ class SGLangModel(Model):
                     image_data.append(image)
         return image_data
 
-    def _render_prompt_messages(
-        self,
-        messages: Messages,
-        system_prompt: str | None,
-        tool_specs: list[ToolSpec] | None,
-        is_multimodal: bool,
-    ) -> tuple[str, list[str]]:
-        """Render messages through the chat template and collect current image data."""
-        multimodal = is_multimodal or self._messages_have_images(messages)
-        hf_messages = self.format_messages(messages, system_prompt, is_multimodal=multimodal)
-        image_data = self._extract_image_data(hf_messages) if multimodal else []
-        tools = self.format_tool_specs(tool_specs) if tool_specs else None
-        prompt = cast(
-            str,
-            self.tokenizer.apply_chat_template(
-                hf_messages,
-                tools=cast(list, tools),
-                add_generation_prompt=True,
-                **self._chat_template_kwargs,
-            ),
-        )
-        return prompt, self._drop_unexpanded_images(image_data, prompt)
-
     def _prepare_prompt_messages(
         self,
         messages: Messages,
@@ -373,14 +349,26 @@ class SGLangModel(Model):
         for byte, so rebuilding the entire prompt on every turn can shift the
         live model context even when conversation history was not rewritten.
         """
-        prompt, image_data = self._render_prompt_messages(messages, system_prompt, tool_specs, is_multimodal)
+        multimodal = is_multimodal or self._messages_have_images(messages)
+        hf_messages = self.format_messages(messages, system_prompt, is_multimodal=multimodal)
+        image_data = self._extract_image_data(hf_messages) if multimodal else []
+        tools = self.format_tool_specs(tool_specs) if tool_specs else None
+        prompt = cast(
+            str,
+            self.tokenizer.apply_chat_template(
+                hf_messages,
+                tools=cast(list, tools),
+                add_generation_prompt=True,
+                **self._chat_template_kwargs,
+            ),
+        )
+        image_data = self._drop_unexpanded_images(image_data, prompt)
         full_input_ids = list(self.tokenizer.encode(prompt, add_special_tokens=False))
         active_prefix_len = len(self._active_input_ids)
 
         if active_prefix_len == 0:
             return _PreparedPrompt(
                 input_ids=full_input_ids,
-                full_input_ids=full_input_ids,
                 new_input_ids=full_input_ids,
                 image_data=image_data,
                 extends_active_context=True,
@@ -391,7 +379,6 @@ class SGLangModel(Model):
                 f"No new messages to tokenize (active_input_len={active_prefix_len}, got {len(messages)} messages)"
             )
 
-        multimodal = is_multimodal or self._messages_have_images(messages)
         additive_messages = len(messages) > self.message_count
         preserves_image_prefix = image_data[: len(self._active_image_data)] == self._active_image_data
         if additive_messages and preserves_image_prefix:
@@ -427,7 +414,6 @@ class SGLangModel(Model):
             input_ids = self._active_input_ids + new_input_ids
             return _PreparedPrompt(
                 input_ids=input_ids,
-                full_input_ids=full_input_ids,
                 new_input_ids=new_input_ids,
                 image_data=image_data,
                 extends_active_context=True,
@@ -444,7 +430,6 @@ class SGLangModel(Model):
 
         return _PreparedPrompt(
             input_ids=full_input_ids,
-            full_input_ids=full_input_ids,
             new_input_ids=new_input_ids,
             image_data=image_data,
             extends_active_context=extends_active_context,
