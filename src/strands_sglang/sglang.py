@@ -527,7 +527,27 @@ class SGLangModel(Model):
 
         # Update token trajectory
         if not prepared_prompt.extends_active_context and len(self.token_manager) > 0:
+            logger.info(
+                "Starting new trajectory: extends_active=%s, message_count=%d, num_messages=%d, "
+                "active_prefix_len=%d, new_input_len=%d, trajectories_so_far=%d",
+                prepared_prompt.extends_active_context,
+                self.message_count,
+                len(messages),
+                len(self._active_input_ids),
+                len(prepared_prompt.new_input_ids),
+                len(self.token_manager.trajectory_start_segment_indices),
+            )
             self.token_manager.start_new_trajectory()
+        else:
+            logger.debug(
+                "Extending context: extends_active=%s, message_count=%d, num_messages=%d, "
+                "active_prefix_len=%d, new_input_len=%d",
+                prepared_prompt.extends_active_context,
+                self.message_count,
+                len(messages),
+                len(self._active_input_ids),
+                len(prepared_prompt.new_input_ids),
+            )
         self.token_manager.add_prompt(
             token_ids=prepared_prompt.new_input_ids,
             logprobs=(
