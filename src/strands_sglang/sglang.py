@@ -381,6 +381,15 @@ class SGLangModel(Model):
 
         additive_messages = len(messages) > self.message_count
         preserves_image_prefix = image_data[: len(self._active_image_data)] == self._active_image_data
+        logger.warning(
+            "PREP_DEBUG: additive=%s, preserves_img=%s, msg_count=%d, num_msgs=%d, active_len=%d, full_len=%d",
+            additive_messages,
+            preserves_image_prefix,
+            self.message_count,
+            len(messages),
+            active_prefix_len,
+            len(full_input_ids),
+        )
         if additive_messages and preserves_image_prefix:
             new_hf_messages = self.format_messages(
                 self.sort_tool_results(messages[self.message_count :]),
@@ -526,27 +535,26 @@ class SGLangModel(Model):
             raise ModelThrottledException(f"Service throttled (status={e.status}): {e.body}") from e
 
         # Update token trajectory
+        logger.warning(
+            "TRAJ_DEBUG: extends_active=%s, message_count=%d, num_messages=%d, "
+            "active_prefix_len=%d, full_input_len=%d, new_input_len=%d, tm_len=%d",
+            prepared_prompt.extends_active_context,
+            self.message_count,
+            len(messages),
+            len(self._active_input_ids),
+            len(prepared_prompt.input_ids),
+            len(prepared_prompt.new_input_ids),
+            len(self.token_manager),
+        )
         if not prepared_prompt.extends_active_context and len(self.token_manager) > 0:
-            logger.info(
-                "Starting new trajectory: extends_active=%s, message_count=%d, num_messages=%d, "
-                "active_prefix_len=%d, new_input_len=%d, trajectories_so_far=%d",
-                prepared_prompt.extends_active_context,
-                self.message_count,
-                len(messages),
-                len(self._active_input_ids),
-                len(prepared_prompt.new_input_ids),
+            logger.warning(
+                "Starting new trajectory: trajectories_so_far=%d",
                 len(self.token_manager.trajectory_start_segment_indices),
             )
             self.token_manager.start_new_trajectory()
         else:
-            logger.debug(
-                "Extending context: extends_active=%s, message_count=%d, num_messages=%d, "
-                "active_prefix_len=%d, new_input_len=%d",
-                prepared_prompt.extends_active_context,
-                self.message_count,
-                len(messages),
-                len(self._active_input_ids),
-                len(prepared_prompt.new_input_ids),
+            logger.warning(
+                "Extending context (no new trajectory)",
             )
         self.token_manager.add_prompt(
             token_ids=prepared_prompt.new_input_ids,
