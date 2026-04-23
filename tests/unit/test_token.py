@@ -20,6 +20,7 @@ import struct
 import pytest
 
 from strands_sglang import Token, TokenManager
+from strands_sglang.token import TokenTrajectory
 
 
 class TestToken:
@@ -50,6 +51,8 @@ class TestTokenManagerBasic:
         assert manager.logprobs == []
         assert manager.segments == []
         assert manager.segment_info == []
+        assert manager.turn_trajectory_ids == []
+        assert manager.trajectories == []
 
 
 class TestTokenManagerAddPrompt:
@@ -155,6 +158,7 @@ class TestTokenManagerMultipleSegments:
         assert manager.token_ids == [1, 2, 3, 4, 5, 6, 7, 8]
         assert manager.loss_mask == [False, False, True, True, False, False, True, True]
         assert manager.logprobs == [None, None, -0.1, -0.2, None, None, -0.3, -0.4]
+        assert manager.turn_trajectory_ids == [0, 0]
         assert len(manager) == 8
 
     def test_segments_property(self):
@@ -324,7 +328,7 @@ class TestRoutedExperts:
         assert list(decoded) == experts
 
     def test_multi_turn_overwrites(self):
-        """Second call overwrites first (SGLang returns routing for ALL tokens each turn)."""
+        """Second call overwrites first within the active trajectory."""
         manager = TokenManager()
 
         # Turn 1: prompt + response routing (3 tokens, 1 layer, top_k=2)
@@ -341,6 +345,27 @@ class TestRoutedExperts:
         decoded = struct.unpack(f"<{len(turn2_experts)}i", result)
         assert list(decoded) == turn2_experts
 
+    def test_split_trajectories_keep_distinct_routing_buffers(self) -> None:
+        """Context resets should keep per-trajectory routing data separate."""
+        manager = TokenManager()
+        first_experts = [10, 11, 12, 13]
+        second_experts = [20, 21]
+
+        manager.add_prompt([1, 2])
+        manager.add_response([3], logprobs=[-0.1])
+        manager.add_routed_experts(_make_routed_experts_b64(first_experts))
+
+        manager.start_new_trajectory()
+        manager.add_prompt([4, 5])
+        manager.add_response([6], logprobs=[-0.2])
+        manager.add_routed_experts(_make_routed_experts_b64(second_experts))
+
+        trajectories = manager.trajectories
+        assert len(trajectories) == 2
+        assert trajectories[0].routed_experts == struct.pack(f"<{len(first_experts)}i", *first_experts)
+        assert trajectories[1].routed_experts == struct.pack(f"<{len(second_experts)}i", *second_experts)
+        assert manager.routed_experts == struct.pack(f"<{len(second_experts)}i", *second_experts)
+
     def test_reset_then_reuse(self):
         """Routing data can be accumulated after reset."""
         manager = TokenManager()
@@ -354,3 +379,51 @@ class TestRoutedExperts:
         assert result is not None
         decoded = struct.unpack(f"<{len(new_experts)}i", result)
         assert list(decoded) == new_experts
+
+
+class TestTokenManagerTrajectories:
+    """Tests for grouped trajectory tracking."""
+
+    def test_start_new_trajectory_splits_grouped_tokens(self) -> None:
+        """Managed context resets should start a new grouped trajectory."""
+        manager = TokenManager()
+        manager.add_prompt([1, 2])
+        manager.add_response([3], logprobs=[-0.1])
+        manager.add_prompt([4])
+        manager.add_response([5], logprobs=[-0.2])
+
+        manager.start_new_trajectory()
+        manager.add_prompt([9, 10])
+        manager.add_response([11], logprobs=[-0.3])
+
+        assert manager.turn_trajectory_ids == [0, 0, 1]
+        assert manager.trajectory_start_segment_indices == [0, 4]
+        assert manager.trajectories == [
+            TokenTrajectory(
+                trajectory_id=0,
+                token_ids=[1, 2, 3, 4, 5],
+                logprobs=[None, None, -0.1, None, -0.2],
+                loss_mask=[0, 0, 1, 0, 1],
+                segment_info=[(False, 2), (True, 1), (False, 1), (True, 1)],
+                routed_experts=None,
+                token_offset=0,
+            ),
+            TokenTrajectory(
+                trajectory_id=1,
+                token_ids=[9, 10, 11],
+                logprobs=[None, None, -0.3],
+                loss_mask=[0, 0, 1],
+                segment_info=[(False, 2), (True, 1)],
+                routed_experts=None,
+                token_offset=5,
+            ),
+        ]
+
+    def test_start_new_trajectory_before_tokens_is_noop(self) -> None:
+        """Starting a new trajectory before any segments exist should do nothing."""
+        manager = TokenManager()
+
+        manager.start_new_trajectory()
+
+        assert manager.trajectory_start_segment_indices == []
+        assert manager.trajectories == []

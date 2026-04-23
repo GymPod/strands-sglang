@@ -42,6 +42,7 @@ def model(mock_tokenizer):
     client._is_multimodal = False
     model = SGLangModel(client=client, tokenizer=mock_tokenizer)
     model.__dict__["message_separator"] = ""  # override cached_property (mock has no real template)
+    model.__dict__["assistant_stop_token_ids"] = []
     return model
 
 
@@ -136,12 +137,12 @@ class TestFormatMessages:
 
 
 class TestTokenizePromptMessages:
-    """Tests for tokenize_prompt_messages error handling."""
+    """Tests for tokenize_prompt_messages prompt-state behavior."""
 
-    def test_no_new_messages_raises(self, model):
-        """Raises RuntimeError when message_count matches input length."""
-        model.token_manager.add_prompt([1, 2, 3])
-        model.message_count = 2
+    def test_no_new_messages_raises(self, model, mock_tokenizer):
+        """Raises RuntimeError when the prompt is unchanged."""
+        model._active_input_ids = [1, 2, 3]
+        mock_tokenizer.encode.return_value = [1, 2, 3]
 
         messages = [
             {"role": "user", "content": [{"text": "Hello"}]},
@@ -150,6 +151,34 @@ class TestTokenizePromptMessages:
 
         with pytest.raises(RuntimeError, match="No new messages to tokenize"):
             model.tokenize_prompt_messages(messages, system_prompt=None)
+
+    def test_additive_prompt_returns_incremental_suffix(self, model, mock_tokenizer):
+        """Continuation prompts only return the suffix beyond the active context."""
+        model._active_input_ids = [10, 11]
+        model.message_count = 2
+        mock_tokenizer.encode.return_value = [10, 11, 12, 13]
+
+        token_ids = model.tokenize_prompt_messages(
+            [
+                {"role": "user", "content": [{"text": "Hello"}]},
+                {"role": "assistant", "content": [{"text": "Continue"}]},
+            ],
+            system_prompt=None,
+        )
+
+        assert token_ids == [12, 13]
+
+    def test_context_reset_returns_full_prompt(self, model, mock_tokenizer):
+        """Compressed/reset prompts are re-tokenized from full current context."""
+        model._active_input_ids = [10, 11, 12]
+        mock_tokenizer.encode.return_value = [90, 91]
+
+        token_ids = model.tokenize_prompt_messages(
+            [{"role": "user", "content": [{"text": "Summary"}]}],
+            system_prompt=None,
+        )
+
+        assert token_ids == [90, 91]
 
 
 class TestSortToolResults:
@@ -237,6 +266,232 @@ class TestStreamDefaults:
         call_kwargs = client.generate.call_args
         assert call_kwargs.kwargs["sampling_params"]["skip_special_tokens"] is False
 
+    async def test_stream_uses_full_prompt_after_context_reset(self, mock_tokenizer):
+        """A context reset sends the new full prompt, not the old trajectory prefix."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            return_value={
+                "text": "reset",
+                "output_ids": [7],
+                "meta_info": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    "e2e_latency": 0.1,
+                    "input_token_logprobs": [[-0.1], [-0.2]],
+                    "output_token_logprobs": [[-0.3]],
+                },
+            }
+        )
+        mock_tokenizer.encode.return_value = [41, 42]
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model._active_input_ids = [10, 11, 12]
+        model.message_count = 1
+
+        messages = [{"role": "user", "content": [{"text": "compressed summary"}]}]
+        async for _ in model.stream(messages):
+            pass
+
+        call_kwargs = client.generate.call_args
+        assert call_kwargs.kwargs["input_ids"] == [41, 42]
+        assert call_kwargs.kwargs["logprob_start_len"] == 0
+        assert model.token_manager.turn_trajectory_ids == [0]
+        assert len(model.token_manager.trajectories) == 1
+
+    async def test_stream_additive_turn_keeps_exact_prior_token_stream(self, mock_tokenizer):
+        """Additive turns must reuse raw previously generated tokens, not reserialized history."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="first", output_ids=[13], num_input_tokens=2),
+                _make_generate_response(text="second", output_ids=[23], num_input_tokens=5),
+            ]
+        )
+        mock_tokenizer.apply_chat_template.side_effect = [
+            "turn-1 prompt",
+            "retokenized full prompt for turn 2",
+            "FAKE PREFIXfollow-up",
+            "FAKE PREFIX",
+        ]
+        mock_tokenizer.encode.side_effect = [
+            [11, 12],
+            [81, 82, 83, 84],
+            [21, 22],
+        ]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = []
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "turn 1"}]}]):
+            pass
+        async for _ in model.stream(
+            [
+                {"role": "user", "content": [{"text": "turn 1"}]},
+                {"role": "assistant", "content": [{"text": "assistant reformatted"}]},
+                {"role": "user", "content": [{"text": "follow-up"}]},
+            ]
+        ):
+            pass
+
+        second_call_kwargs = client.generate.call_args_list[1].kwargs
+        assert second_call_kwargs["input_ids"] == [11, 12, 13, 21, 22]
+        assert second_call_kwargs["logprob_start_len"] == 2
+        assert model.token_manager.turn_trajectory_ids == [0, 0]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [[11, 12, 13, 21, 22, 23]]
+
+    async def test_stream_tool_result_turn_inserts_missing_assistant_stop_token(self, mock_tokenizer):
+        """Tool-result continuations must restore the assistant stop token if SGLang omits it."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(
+                    text='<tool_call>{"name": "calc", "arguments": {"expr": "1+1"}}</tool_call>',
+                    output_ids=[13],
+                    num_input_tokens=2,
+                ),
+                _make_generate_response(text="The answer is 2.", output_ids=[23], num_input_tokens=6),
+            ]
+        )
+        mock_tokenizer.apply_chat_template.side_effect = [
+            "turn-1 prompt",
+            "retokenized full prompt for turn 2",
+            "FAKE PREFIXfollow-up tool result",
+            "FAKE PREFIX",
+        ]
+        mock_tokenizer.encode.side_effect = [
+            [11, 12],
+            [11, 12, 13, 99, 21, 22],
+            [21, 22],
+        ]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = [99]
+
+        turn_1_messages = [{"role": "user", "content": [{"text": "What is 1+1?"}]}]
+        async for _ in model.stream(
+            turn_1_messages,
+            tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}],
+        ):
+            pass
+
+        assert model._active_input_ids == [11, 12, 13, 99]
+
+        turn_2_messages = turn_1_messages + [
+            {
+                "role": "assistant",
+                "content": [
+                    {"text": '<tool_call>{"name": "calc", "arguments": {"expr": "1+1"}}</tool_call>'},
+                    {"toolUse": {"toolUseId": "call_0000", "name": "calc", "input": {"expr": "1+1"}}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"toolResult": {"toolUseId": "call_0000", "content": [{"text": "2"}]}}],
+            },
+        ]
+        async for _ in model.stream(
+            turn_2_messages,
+            tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}],
+        ):
+            pass
+
+        second_call_kwargs = client.generate.call_args_list[1].kwargs
+        assert second_call_kwargs["input_ids"] == [11, 12, 13, 99, 21, 22]
+        assert second_call_kwargs["logprob_start_len"] == 3
+        assert model.token_manager.turn_trajectory_ids == [0, 0]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [[11, 12, 13, 21, 22, 23]]
+
+    async def test_stream_marks_new_trajectory_after_context_reset(self, mock_tokenizer):
+        """A non-prefix prompt reset should start a new grouped trajectory."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                {
+                    "text": "first",
+                    "output_ids": [13],
+                    "meta_info": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop"},
+                        "e2e_latency": 0.1,
+                        "input_token_logprobs": [[-0.1], [-0.2]],
+                        "output_token_logprobs": [[-0.3]],
+                    },
+                },
+                {
+                    "text": "second",
+                    "output_ids": [91],
+                    "meta_info": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop"},
+                        "e2e_latency": 0.1,
+                        "input_token_logprobs": [[-0.4], [-0.5]],
+                        "output_token_logprobs": [[-0.6]],
+                    },
+                },
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [[11, 12], [41, 42]]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = []
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "first"}]}]):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "summary"}]}]):
+            pass
+
+        assert model.token_manager.turn_trajectory_ids == [0, 1]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [[11, 12, 13], [41, 42, 91]]
+
+    async def test_summary_style_resets_preserve_exact_token_partition(self, mock_tokenizer):
+        """Summary-like rewrites should partition the global token stream without loss or duplication."""
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._is_multimodal = False
+        client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="first", output_ids=[13], num_input_tokens=2),
+                _make_generate_response(text="summary", output_ids=[23], num_input_tokens=2),
+                _make_generate_response(text="post-summary", output_ids=[33], num_input_tokens=2),
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [[11, 12], [21, 22], [31, 32]]
+
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = []
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "original"}]}]):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "Please summarize this conversation."}]}]):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "continue from summary"}]}]):
+            pass
+
+        assert model.token_manager.turn_trajectory_ids == [0, 1, 2]
+        assert [trajectory.token_ids for trajectory in model.token_manager.trajectories] == [
+            [11, 12, 13],
+            [21, 22, 23],
+            [31, 32, 33],
+        ]
+        assert [trajectory.loss_mask for trajectory in model.token_manager.trajectories] == [
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+        ]
+        _assert_trajectory_partition(model)
+
 
 # ---------------------------------------------------------------------------
 # Helpers for routing replay end-to-end tests
@@ -267,7 +522,7 @@ def _make_generate_response(
 ) -> dict:
     """Build a mock SGLang /generate response.
 
-    When include_routing is True, generates deterministic per-token routing:
+    When include_routing is True, generates deterministic per-transition routing:
     token at position i gets experts [i*10, i*10+1, i*10+2, i*10+3]
     (for NUM_LAYERS=2, TOP_K=2).
     """
@@ -283,9 +538,9 @@ def _make_generate_response(
     }
 
     if include_routing:
-        # Generate routing for tokens from routing_start to total-1
+        # Generate routing for transitions from routing_start to total-2.
         expert_ids = []
-        for pos in range(routing_start, total):
+        for pos in range(routing_start, max(total - 1, routing_start)):
             expert_ids.extend([pos * 10 + k for k in range(EXPERTS_PER_TOKEN)])
         meta_info["routed_experts"] = _make_routing_b64(expert_ids)
 
@@ -304,6 +559,28 @@ async def _collect_stream(stream):
     return [event async for event in stream]
 
 
+def _assert_trajectory_partition(model: SGLangModel) -> None:
+    """Assert grouped trajectories exactly partition the flat token stream."""
+    trajectories = model.token_manager.trajectories
+    assert trajectories
+
+    flat_token_ids = model.token_manager.token_ids
+    flat_logprobs = model.token_manager.logprobs
+    flat_loss_mask = model.token_manager.loss_mask
+
+    assert [token_id for trajectory in trajectories for token_id in trajectory.token_ids] == flat_token_ids
+    assert [logprob for trajectory in trajectories for logprob in trajectory.logprobs] == flat_logprobs
+    assert [mask for trajectory in trajectories for mask in trajectory.loss_mask] == flat_loss_mask
+
+    expected_offset = 0
+    for trajectory in trajectories:
+        assert trajectory.token_offset == expected_offset
+        if trajectory.routed_experts is not None:
+            routing_entries = len(_decode_routing(trajectory.routed_experts)) // EXPERTS_PER_TOKEN
+            assert routing_entries == max(len(trajectory.token_ids) - 1, 0)
+        expected_offset += len(trajectory.token_ids)
+
+
 class TestRoutedExpertsE2E:
     """End-to-end tests for routing replay through SGLangModel.stream()."""
 
@@ -320,10 +597,11 @@ class TestRoutedExpertsE2E:
         client._is_multimodal = False
         m = SGLangModel(client=client, tokenizer=mock_tokenizer, return_routed_experts=True)
         m.__dict__["message_separator"] = ""
+        m.__dict__["assistant_stop_token_ids"] = []
         return m
 
     async def test_single_turn_routing(self, model):
-        """Single turn: routing covers prompt + response tokens."""
+        """Single turn: routing covers local trajectory transitions."""
         prompt_tokens = [10, 20, 30]
         output_ids = [40, 50]
 
@@ -345,18 +623,20 @@ class TestRoutedExpertsE2E:
         routing = model.token_manager.routed_experts
         assert routing is not None
         decoded = _decode_routing(routing)
-        assert len(decoded) == 5 * EXPERTS_PER_TOKEN
+        assert len(decoded) == 4 * EXPERTS_PER_TOKEN
 
-        for pos in range(5):
+        for pos in range(4):
             chunk = decoded[pos * EXPERTS_PER_TOKEN : (pos + 1) * EXPERTS_PER_TOKEN]
             assert chunk == [pos * 10 + k for k in range(EXPERTS_PER_TOKEN)]
+        assert model.token_manager.trajectories[0].routed_experts == routing
 
     async def test_multi_turn_with_tool_call(self, model, mock_tokenizer):
-        """Multi-turn with overwrite semantics: turn 2 returns routing for ALL tokens.
+        """Multi-turn with overwrite semantics within the active trajectory.
 
         SGLang does not support routed_experts_start_len, so each response
-        includes routing for every token in the sequence. The latest response
-        overwrites (not accumulates) the previous routing data.
+        includes routing for every local transition in the active trajectory.
+        The latest response overwrites (not accumulates) the previous routing
+        data for that trajectory.
         """
         # --- Turn 1: user prompt -> model generates tool call ---
         prompt_tokens_t1 = [10, 20, 30]
@@ -373,13 +653,17 @@ class TestRoutedExpertsE2E:
 
         with patch.object(model.client, "generate", new_callable=AsyncMock, return_value=response_t1):
             messages_t1 = [{"role": "user", "content": [{"text": "What is 1+1?"}]}]
-            await _collect_stream(model.stream(messages_t1, tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}]))
+            await _collect_stream(
+                model.stream(
+                    messages_t1, tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}]
+                )
+            )
 
         assert model.token_manager.token_ids == prompt_tokens_t1 + output_ids_t1
         total_after_t1 = len(model.token_manager)  # 5
 
         # --- Turn 2: tool result -> model generates final answer ---
-        # SGLang returns routing for ALL tokens (routing_start=0), not just new ones
+        # SGLang returns routing for ALL active transitions (routing_start=0), not just new ones
         tool_result_tokens = [60, 70]
         output_ids_t2 = [80, 90, 100]
         mock_tokenizer.encode.return_value = tool_result_tokens
@@ -389,7 +673,7 @@ class TestRoutedExpertsE2E:
             text="The answer is 2.",
             output_ids=output_ids_t2,
             num_input_tokens=total_input_t2,
-            routing_start=0,  # SGLang returns routing for ALL tokens
+            routing_start=0,  # SGLang returns routing for all active transitions
             include_routing=True,
         )
 
@@ -409,7 +693,11 @@ class TestRoutedExpertsE2E:
                     ],
                 },
             ]
-            await _collect_stream(model.stream(messages_t2, tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}]))
+            await _collect_stream(
+                model.stream(
+                    messages_t2, tool_specs=[{"name": "calc", "description": "calc", "inputSchema": {"json": {}}}]
+                )
+            )
 
             # Verify return_routed_experts is passed to generate
             call_kwargs = mock_gen.call_args.kwargs
@@ -421,19 +709,26 @@ class TestRoutedExpertsE2E:
         total_tokens = len(expected_ids)  # 10
 
         # Routing is from turn 2 only (overwrite, not accumulate).
-        # Turn 2 returned routing for ALL 10 tokens (routing_start=0).
+        # Turn 2 returned routing for ALL 9 transitions in the 10-token trajectory.
         routing = model.token_manager.routed_experts
         assert routing is not None
         decoded = _decode_routing(routing)
-        assert len(decoded) == total_tokens * EXPERTS_PER_TOKEN
+        assert len(decoded) == (total_tokens - 1) * EXPERTS_PER_TOKEN
 
         # Verify per-token expert IDs from turn 2's response
-        for pos in range(total_tokens):
+        for pos in range(total_tokens - 1):
             chunk = decoded[pos * EXPERTS_PER_TOKEN : (pos + 1) * EXPERTS_PER_TOKEN]
             assert chunk == [pos * 10 + k for k in range(EXPERTS_PER_TOKEN)]
 
+        trajectories = model.token_manager.trajectories
+        assert len(trajectories) == 1
+        assert trajectories[0].trajectory_id == 0
+        assert trajectories[0].token_offset == 0
+        assert trajectories[0].token_ids == expected_ids
+        assert trajectories[0].routed_experts == routing
+
     async def test_routing_aligns_with_loss_mask(self, model, mock_tokenizer):
-        """Routing entries align 1:1 with token_ids and loss_mask."""
+        """Routing entries align 1:1 with token transitions."""
         prompt_tokens = [10, 20, 30]
         output_ids = [40, 50]
         mock_tokenizer.encode.return_value = prompt_tokens
@@ -453,9 +748,37 @@ class TestRoutedExpertsE2E:
         n_tokens = len(model.token_manager.token_ids)
         routing_entries = len(_decode_routing(model.token_manager.routed_experts)) // EXPERTS_PER_TOKEN
 
-        assert routing_entries == n_tokens
+        assert routing_entries == n_tokens - 1
         assert len(model.token_manager.loss_mask) == n_tokens
         assert len(model.token_manager.logprobs) == n_tokens
+
+    async def test_context_reset_keeps_routing_local_to_each_trajectory(self, model, mock_tokenizer):
+        """Managed context resets must snapshot routing per split trajectory."""
+        model.client.generate = AsyncMock(
+            side_effect=[
+                _make_generate_response(text="first", output_ids=[13], num_input_tokens=2, include_routing=True),
+                _make_generate_response(text="summary", output_ids=[23], num_input_tokens=2, include_routing=True),
+            ]
+        )
+        mock_tokenizer.encode.side_effect = [[11, 12], [21, 22]]
+
+        async for _ in model.stream([{"role": "user", "content": [{"text": "first"}]}]):
+            pass
+        async for _ in model.stream([{"role": "user", "content": [{"text": "summary"}]}]):
+            pass
+
+        trajectories = model.token_manager.trajectories
+        assert len(trajectories) == 2
+        assert [trajectory.token_ids for trajectory in trajectories] == [[11, 12, 13], [21, 22, 23]]
+        assert [trajectory.token_offset for trajectory in trajectories] == [0, 3]
+
+        first_routing = trajectories[0].routed_experts
+        second_routing = trajectories[1].routed_experts
+        assert first_routing is not None
+        assert second_routing is not None
+        assert _decode_routing(first_routing) == [0, 1, 2, 3, 10, 11, 12, 13]
+        assert _decode_routing(second_routing) == [0, 1, 2, 3, 10, 11, 12, 13]
+        assert model.token_manager.routed_experts == second_routing
 
     async def test_routing_disabled_by_default(self, mock_tokenizer):
         """When return_routed_experts is not set, no routing data is recorded."""
@@ -463,6 +786,7 @@ class TestRoutedExpertsE2E:
         client._is_multimodal = False
         model = SGLangModel(client=client, tokenizer=mock_tokenizer)
         model.__dict__["message_separator"] = ""
+        model.__dict__["assistant_stop_token_ids"] = []
 
         mock_tokenizer.encode.return_value = [10, 20]
         response = _make_generate_response(

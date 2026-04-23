@@ -20,6 +20,7 @@ import base64
 import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterable
+from dataclasses import dataclass
 from functools import cached_property
 from typing import (
     Any,
@@ -48,6 +49,16 @@ from .tool_parsers import HermesToolParser, ToolParser
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPrompt:
+    """Prompt prepared for one `/generate` call."""
+
+    input_ids: list[int]
+    new_input_ids: list[int]
+    image_data: list[str]
+    extends_active_context: bool
 
 
 class SGLangModel(Model):
@@ -100,15 +111,19 @@ class SGLangModel(Model):
 
         # State tracking (this makes SGLangModel stateful)
         self.token_manager = TokenManager()
+        self._active_input_ids: list[int] = []
+        self._active_image_data: list[str] = []
         self.message_count: int = 0
         self.tool_parse_errors: dict[str, int] = {}  # per-tool parse error count
-        self.image_data: list[str] = []  # accumulated image data URLs (VLM only)
+        self.image_data: list[str] = []  # current prompt image data URLs (VLM only)
 
         logger.debug("initialized with config: %s", self.config)
 
     def reset(self) -> None:
         """Reset all state for a new episode."""
         self.token_manager.reset()
+        self._active_input_ids = []
+        self._active_image_data = []
         self.message_count = 0
         self.tool_parse_errors = {}
         self.image_data = []
@@ -147,6 +162,31 @@ class SGLangModel(Model):
         )
         sep = self.tokenizer.encode(probe.split("__M__", 1)[1], add_special_tokens=False)[1:]
         return self.tokenizer.decode(sep) if sep else ""
+
+    @cached_property
+    def assistant_stop_token_ids(self) -> list[int]:
+        """Auto-detect the assistant stop token(s) emitted before the next message bridge."""
+        probe = str(
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": "U"}, {"role": "assistant", "content": "__M__"}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        )
+        if "__M__" not in probe:
+            return []
+        suffix = probe.split("__M__", 1)[1]
+        stop_text = suffix[: -len(self.message_separator)] if self.message_separator else suffix
+        return list(self.tokenizer.encode(stop_text, add_special_tokens=False))
+
+    def _append_missing_assistant_stop(self, token_ids: list[int]) -> list[int]:
+        """Append assistant stop token(s) when the server omits them from output_ids."""
+        stop_ids = self.assistant_stop_token_ids
+        if not stop_ids:
+            return token_ids
+        if len(token_ids) >= len(stop_ids) and token_ids[-len(stop_ids) :] == stop_ids:
+            return token_ids
+        return token_ids + stop_ids
 
     @classmethod
     def format_content_block(
@@ -249,63 +289,183 @@ class SGLangModel(Model):
     ) -> list[int]:
         """Tokenize prompt messages for the next generation call.
 
-        Notes:
-            - First call: tokenizes full prompt with system prompt and tools.
-            - Subsequent calls: uses a fake prefix (system + user) for boundary formatting,
-            then subtracts it to extract only incremental tokens.
+        Returns the prompt tokens newly introduced relative to the active model
+        context. When conversation management resets or compresses history, the
+        active context no longer prefixes the current prompt, so the full prompt
+        is returned as a new prompt segment.
         """
+        return self._prepare_prompt_messages(
+            messages=messages,
+            system_prompt=system_prompt,
+            tool_specs=tool_specs,
+            is_multimodal=is_multimodal,
+        ).new_input_ids
 
-        # TODO: add support for other modalities (e.g. audio, video, etc.)
-        def update_multimodal_data(hf_messages: list[dict[str, Any]]) -> None:
-            if not is_multimodal:
-                return
-            for msg in hf_messages:
-                for part in msg["content"]:
-                    match part.get("type"):
-                        case "image":
-                            self.image_data.append(part["image"])
+    @staticmethod
+    def _messages_have_images(messages: Messages) -> bool:
+        """Return whether any message content includes image data."""
 
-        # First call: full prompt with tools
-        if self.message_count == 0:
-            hf_messages = self.format_messages(messages, system_prompt, is_multimodal=is_multimodal)
-            update_multimodal_data(hf_messages)
-            tools = self.format_tool_specs(tool_specs) if tool_specs else None
-            prompt = cast(
-                str,
-                self.tokenizer.apply_chat_template(
-                    hf_messages, tools=cast(list, tools), add_generation_prompt=True, **self._chat_template_kwargs
-                ),
+        def _content_has_image(content_block: ContentBlock | ToolResultContent) -> bool:
+            if "image" in content_block:
+                return True
+            tool_result = content_block.get("toolResult")
+            if not isinstance(tool_result, dict):
+                return False
+            nested_content = tool_result.get("content")
+            if not isinstance(nested_content, list):
+                return False
+            return any(isinstance(item, dict) and _content_has_image(item) for item in nested_content)
+
+        return any(_content_has_image(content_block) for message in messages for content_block in message["content"])
+
+    @staticmethod
+    def _extract_image_data(hf_messages: list[dict[str, Any]]) -> list[str]:
+        """Collect image data URLs from HF-formatted multimodal messages."""
+        image_data: list[str] = []
+        for msg in hf_messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image":
+                    image = part.get("image")
+                    if not isinstance(image, str):
+                        raise TypeError(f"Expected image data URL to be str, got {type(image).__name__}")
+                    image_data.append(image)
+        return image_data
+
+    def _prepare_prompt_messages(
+        self,
+        messages: Messages,
+        system_prompt: str | None,
+        tool_specs: list[ToolSpec] | None,
+        is_multimodal: bool,
+    ) -> _PreparedPrompt:
+        """Prepare the current prompt and incremental training segment.
+
+        For additive turns, keep the exact previously generated token stream and
+        only tokenize the newly introduced messages. Assistant outputs and tool
+        calls are not guaranteed to round-trip through the chat template byte
+        for byte, so rebuilding the entire prompt on every turn can shift the
+        live model context even when conversation history was not rewritten.
+        """
+        multimodal = is_multimodal or self._messages_have_images(messages)
+        hf_messages = self.format_messages(messages, system_prompt, is_multimodal=multimodal)
+        image_data = self._extract_image_data(hf_messages) if multimodal else []
+        tools = self.format_tool_specs(tool_specs) if tool_specs else None
+        prompt = cast(
+            str,
+            self.tokenizer.apply_chat_template(
+                hf_messages,
+                tools=cast(list, tools),
+                add_generation_prompt=True,
+                **self._chat_template_kwargs,
+            ),
+        )
+        image_data = self._drop_unexpanded_images(image_data, prompt)
+        full_input_ids = list(self.tokenizer.encode(prompt, add_special_tokens=False))
+        active_prefix_len = len(self._active_input_ids)
+
+        if active_prefix_len == 0:
+            return _PreparedPrompt(
+                input_ids=full_input_ids,
+                new_input_ids=full_input_ids,
+                image_data=image_data,
+                extends_active_context=True,
             )
-            return list(self.tokenizer.encode(prompt, add_special_tokens=False))
 
-        # Incremental: fake prefix subtraction with message_separator bridge
-        if len(messages) > self.message_count:
+        if full_input_ids == self._active_input_ids and image_data == self._active_image_data:
+            raise RuntimeError(
+                f"No new messages to tokenize (active_input_len={active_prefix_len}, got {len(messages)} messages)"
+            )
+
+        additive_messages = len(messages) > self.message_count
+        preserves_image_prefix = image_data[: len(self._active_image_data)] == self._active_image_data
+        logger.warning(
+            "PREP_DEBUG: additive=%s, preserves_img=%s, msg_count=%d, num_msgs=%d, active_len=%d, full_len=%d",
+            additive_messages,
+            preserves_image_prefix,
+            self.message_count,
+            len(messages),
+            active_prefix_len,
+            len(full_input_ids),
+        )
+        if additive_messages and preserves_image_prefix:
             new_hf_messages = self.format_messages(
-                self.sort_tool_results(messages[self.message_count :]), is_multimodal=is_multimodal
+                self.sort_tool_results(messages[self.message_count :]),
+                is_multimodal=multimodal,
             )
-            update_multimodal_data(new_hf_messages)
-            fake_messages = [
+            fake_messages: Messages = [
                 {"role": "system", "content": [{"text": "FAKE SYSTEM PROMPT"}]},
                 {"role": "user", "content": [{"text": "FAKE USER MESSAGE"}]},
             ]
-            fake_hf_messages = self.format_messages(cast(Messages, fake_messages), is_multimodal=is_multimodal)
-            full_prompt = cast(
+            fake_hf_messages = self.format_messages(fake_messages, is_multimodal=multimodal)
+            delta_prompt_with_prefix = cast(
                 str,
                 self.tokenizer.apply_chat_template(
-                    fake_hf_messages + new_hf_messages, add_generation_prompt=True, **self._chat_template_kwargs
+                    fake_hf_messages + new_hf_messages,
+                    add_generation_prompt=True,
+                    **self._chat_template_kwargs,
                 ),
             )
-            prefix_prompt = cast(
+            fake_prefix_prompt = cast(
                 str,
                 self.tokenizer.apply_chat_template(
-                    fake_hf_messages, add_generation_prompt=False, **self._chat_template_kwargs
+                    fake_hf_messages,
+                    add_generation_prompt=False,
+                    **self._chat_template_kwargs,
                 ),
             )
-            assert full_prompt.startswith(prefix_prompt), "full prompt must start with prefix prompt"
-            prompt = self.message_separator + full_prompt[len(prefix_prompt) :]
-            return list(self.tokenizer.encode(prompt, add_special_tokens=False))
+            if not delta_prompt_with_prefix.startswith(fake_prefix_prompt):
+                raise AssertionError("incremental prompt must start with the fake prefix prompt")
+            delta_prompt = self.message_separator + delta_prompt_with_prefix[len(fake_prefix_prompt) :]
+            new_input_ids = list(self.tokenizer.encode(delta_prompt, add_special_tokens=False))
+            input_ids = self._active_input_ids + new_input_ids
+            return _PreparedPrompt(
+                input_ids=input_ids,
+                new_input_ids=new_input_ids,
+                image_data=image_data,
+                extends_active_context=True,
+            )
 
-        raise RuntimeError(f"No new messages to tokenize (message_count={self.message_count}, got {len(messages)})")
+        extends_active_context = (
+            full_input_ids[:active_prefix_len] == self._active_input_ids
+            and image_data[: len(self._active_image_data)] == self._active_image_data
+        )
+        if extends_active_context:
+            new_input_ids = full_input_ids[active_prefix_len:]
+        else:
+            new_input_ids = full_input_ids
+
+        return _PreparedPrompt(
+            input_ids=full_input_ids,
+            new_input_ids=new_input_ids,
+            image_data=image_data,
+            extends_active_context=extends_active_context,
+        )
+
+    def _drop_unexpanded_images(self, image_data: list[str], template_output: str) -> list[str]:
+        """Remove images whose data URLs survive in the chat template output.
+
+        When a chat template expands an image, it *consumes* the data URL and
+        replaces it with model-specific vision tokens (e.g. ``<|vision_start|>``).
+        If a data URL appears verbatim in the rendered string, the template did
+        not generate placeholder tokens for it and SGLang will warn about more
+        image data items than corresponding tokens.  Drop those entries so the
+        positional mapping stays correct.
+        """
+        if not image_data:
+            return []
+        kept = [img for img in image_data if img not in template_output]
+        n_dropped = len(image_data) - len(kept)
+        if n_dropped:
+            logger.warning(
+                "Dropped %d/%d images whose data URLs were not expanded by the chat template "
+                "(likely images in message roles the template does not support)",
+                n_dropped,
+                len(image_data),
+            )
+        return kept
 
     # -------------------------------------------------------------------------
     # Generation
@@ -328,15 +488,14 @@ class SGLangModel(Model):
         sampling_params: dict[str, Any] = dict(config.get("sampling_params") or {})
         sampling_params.setdefault("skip_special_tokens", False)
         return_logprob = config.get("return_logprob", True)
-        is_multimodal = await self.client.is_multimodal()
-        new_input_ids = self.tokenize_prompt_messages(
+        prepared_prompt = self._prepare_prompt_messages(
             messages=messages,
             system_prompt=system_prompt,
             tool_specs=tool_specs,
-            is_multimodal=is_multimodal,
+            is_multimodal=await self.client.is_multimodal(),
         )
-        # Tracking token IDs in token_manager to ensure the token-in feature
-        input_ids = self.token_manager.token_ids + new_input_ids
+        input_ids = prepared_prompt.input_ids
+        self.image_data = prepared_prompt.image_data
 
         # Assistant message start
         yield {"messageStart": {"role": "assistant"}}
@@ -349,7 +508,13 @@ class SGLangModel(Model):
                 input_ids=input_ids,
                 sampling_params=sampling_params,
                 return_logprob=return_logprob,
-                logprob_start_len=max(0, len(self.token_manager.token_ids) - 1) if return_logprob else None,
+                logprob_start_len=(
+                    max(0, len(self._active_input_ids) - 1)
+                    if return_logprob and prepared_prompt.extends_active_context and self._active_input_ids
+                    else 0
+                    if return_logprob
+                    else None
+                ),
                 image_data=self.image_data or None,
                 return_routed_experts=return_routed_experts,
             )
@@ -370,18 +535,47 @@ class SGLangModel(Model):
             raise ModelThrottledException(f"Service throttled (status={e.status}): {e.body}") from e
 
         # Update token trajectory
+        logger.warning(
+            "TRAJ_DEBUG: extends_active=%s, message_count=%d, num_messages=%d, "
+            "active_prefix_len=%d, full_input_len=%d, new_input_len=%d, tm_len=%d",
+            prepared_prompt.extends_active_context,
+            self.message_count,
+            len(messages),
+            len(self._active_input_ids),
+            len(prepared_prompt.input_ids),
+            len(prepared_prompt.new_input_ids),
+            len(self.token_manager),
+        )
+        if not prepared_prompt.extends_active_context and len(self.token_manager) > 0:
+            logger.warning(
+                "Starting new trajectory: trajectories_so_far=%d",
+                len(self.token_manager.trajectory_start_segment_indices),
+            )
+            self.token_manager.start_new_trajectory()
+        else:
+            logger.warning(
+                "Extending context (no new trajectory)",
+            )
         self.token_manager.add_prompt(
-            token_ids=new_input_ids,
-            logprobs=[e[0] for e in input_token_logprobs[-len(new_input_ids) :]] if input_token_logprobs else None,
+            token_ids=prepared_prompt.new_input_ids,
+            logprobs=(
+                [entry[0] for entry in input_token_logprobs[-len(prepared_prompt.new_input_ids) :]]
+                if input_token_logprobs and prepared_prompt.new_input_ids
+                else None
+            ),
         )
         self.token_manager.add_response(
             token_ids=output_ids,
             logprobs=[e[0] for e in output_token_logprobs] if output_token_logprobs else None,
         )
+        active_input_ids = prepared_prompt.input_ids + output_ids
+        if meta_info["finish_reason"]["type"] != "length":
+            active_input_ids = self._append_missing_assistant_stop(active_input_ids)
+        self._active_input_ids = active_input_ids
+        self._active_image_data = list(prepared_prompt.image_data)
         self.message_count = len(messages) + 1
 
-        # Store routed experts for routing replay (overwrite semantics —
-        # SGLang returns routing for ALL tokens each turn, not incremental)
+        # Store routed experts for routing replay.
         if return_routed_experts:
             routed_experts_data = meta_info.get("routed_experts")
             if routed_experts_data:
@@ -454,13 +648,12 @@ class SGLangModel(Model):
         json_schema = json.dumps(output_model.model_json_schema())
 
         # Format and tokenize prompt (no tools for structured output)
-        is_multimodal = await self.client.is_multimodal()
-        hf_messages = self.format_messages(prompt, system_prompt, is_multimodal=is_multimodal)
-        formatted_prompt = cast(
-            str,
-            self.tokenizer.apply_chat_template(hf_messages, add_generation_prompt=True, **self._chat_template_kwargs),
+        prepared_prompt = self._prepare_prompt_messages(
+            messages=prompt,
+            system_prompt=system_prompt,
+            tool_specs=None,
+            is_multimodal=await self.client.is_multimodal(),
         )
-        input_ids = self.tokenizer.encode(formatted_prompt, add_special_tokens=False)
 
         # Build sampling params with json_schema constraint
         config = self.get_config()
@@ -470,9 +663,10 @@ class SGLangModel(Model):
         # Call SGLang /generate endpoint
         try:
             response = await self.client.generate(
-                input_ids=input_ids,
+                input_ids=prepared_prompt.input_ids,
                 sampling_params=sampling_params,
                 return_logprob=False,  # No need for logprobs in structured output
+                image_data=prepared_prompt.image_data or None,
             )
         except SGLangContextLengthError as e:
             raise ContextWindowOverflowException(f"Context length exceeded: {e.body}") from e

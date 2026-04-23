@@ -72,6 +72,7 @@ class TestGetSession:
 
         session = client._get_session()
         assert session is not None
+        assert client._session is session
 
     async def test_reuses_session_on_subsequent_calls(self):
         """Subsequent calls return the same session."""
